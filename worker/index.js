@@ -1,0 +1,1728 @@
+/**
+ * =====================================================================
+ *  MASAR — Cloudflare Worker (API)
+ *  نظام إدارة العمليات والشحنات | شركة عبر الشرق النفطية
+ *  المؤلف: م. مهند المظفر — قسم التكنولوجيا
+ *
+ *  بنية: D1 (قاعدة بيانات) + R2 (مستندات) + JWT (جلسات) + PBKDF2 (كلمات المرور)
+ *  ملف واحد، يُنشر كما هو عبر: wrangler deploy
+ * =====================================================================
+ */
+
+const JSON_HEADERS = { "Content-Type": "application/json; charset=utf-8" };
+
+// أدوار النظام
+const ROLES = ["admin", "manager", "logistics", "customs", "transport", "accounting", "viewer"];
+
+// مراحل دورة حياة الشحنة (الترتيب مهم لمنطق الانتقال)
+const SHIPMENT_STATUSES = [
+  "draft", "opened", "at_port", "customs_clearance",
+  "in_transport", "delivered", "closed", "cancelled",
+];
+
+// =====================================================================
+//  أدوات مساعدة عامة
+// =====================================================================
+// أصول مسموح بها فقط (الرابط الإنتاجي + معاينات pages.dev + التطوير المحلي)
+const ALLOWED_ORIGINS = [
+  "https://masar-bhw.pages.dev",
+  "http://localhost:8788",
+  "http://127.0.0.1:8788",
+];
+const PAGES_PREVIEW_RE = /^https:\/\/[a-z0-9-]+\.masar-bhw\.pages\.dev$/;
+
+function cors(origin) {
+  // الافتراضي: الرابط الإنتاجي. الأصول غير المعروفة لن تتطابق فيمنعها المتصفح.
+  let allow = "https://masar-bhw.pages.dev";
+  if (origin && (ALLOWED_ORIGINS.includes(origin) || PAGES_PREVIEW_RE.test(origin))) {
+    allow = origin;
+  }
+  return {
+    "Access-Control-Allow-Origin": allow,
+    "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type,Authorization",
+    "Access-Control-Max-Age": "86400",
+    "Vary": "Origin",
+  };
+}
+
+function json(data, status = 200, extraHeaders = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { ...JSON_HEADERS, ...extraHeaders },
+  });
+}
+
+function err(message, status = 400, extra = {}) {
+  return json({ ok: false, error: message, ...extra }, status);
+}
+
+function ok(data = {}) {
+  return json({ ok: true, ...data });
+}
+
+// =====================================================================
+//  تشفير: base64url / PBKDF2 / JWT (HMAC-SHA256)
+// =====================================================================
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+
+function b64urlEncode(bytes) {
+  let bin = "";
+  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  for (const b of arr) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function b64urlDecode(str) {
+  str = str.replace(/-/g, "+").replace(/_/g, "/");
+  while (str.length % 4) str += "=";
+  const bin = atob(str);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+// ---- PBKDF2 لكلمات المرور ----
+async function hashPassword(password, iterations = 100000) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw", enc.encode(password), "PBKDF2", false, ["deriveBits"]
+  );
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", salt, iterations, hash: "SHA-256" },
+    keyMaterial, 256
+  );
+  return `pbkdf2:${iterations}:${b64urlEncode(salt)}:${b64urlEncode(new Uint8Array(bits))}`;
+}
+
+async function verifyPassword(password, stored) {
+  try {
+    const [scheme, iterStr, saltB64, hashB64] = stored.split(":");
+    if (scheme !== "pbkdf2") return false;
+    const iterations = parseInt(iterStr, 10);
+    const salt = b64urlDecode(saltB64);
+    const keyMaterial = await crypto.subtle.importKey(
+      "raw", enc.encode(password), "PBKDF2", false, ["deriveBits"]
+    );
+    const bits = await crypto.subtle.deriveBits(
+      { name: "PBKDF2", salt, iterations, hash: "SHA-256" },
+      keyMaterial, 256
+    );
+    const calc = b64urlEncode(new Uint8Array(bits));
+    // مقارنة بزمن ثابت
+    if (calc.length !== hashB64.length) return false;
+    let diff = 0;
+    for (let i = 0; i < calc.length; i++) diff |= calc.charCodeAt(i) ^ hashB64.charCodeAt(i);
+    return diff === 0;
+  } catch {
+    return false;
+  }
+}
+
+// ---- JWT ----
+async function hmacKey(secret) {
+  return crypto.subtle.importKey(
+    "raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]
+  );
+}
+
+async function signJWT(payload, secret, ttlSeconds = 60 * 60 * 12) {
+  const header = { alg: "HS256", typ: "JWT" };
+  const now = Math.floor(Date.now() / 1000);
+  const body = { ...payload, iat: now, exp: now + ttlSeconds };
+  const h = b64urlEncode(enc.encode(JSON.stringify(header)));
+  const p = b64urlEncode(enc.encode(JSON.stringify(body)));
+  const data = `${h}.${p}`;
+  const key = await hmacKey(secret);
+  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(data));
+  return `${data}.${b64urlEncode(new Uint8Array(sig))}`;
+}
+
+async function verifyJWT(token, secret) {
+  try {
+    const [h, p, s] = token.split(".");
+    if (!h || !p || !s) return null;
+    const key = await hmacKey(secret);
+    const valid = await crypto.subtle.verify(
+      "HMAC", key, b64urlDecode(s), enc.encode(`${h}.${p}`)
+    );
+    if (!valid) return null;
+    const payload = JSON.parse(dec.decode(b64urlDecode(p)));
+    if (payload.exp && Math.floor(Date.now() / 1000) > payload.exp) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+// =====================================================================
+//  أدوات قاعدة البيانات والمساعدات
+// =====================================================================
+async function logActivity(env, { userId, action, entityType, entityId, details, ip }) {
+  try {
+    await env.DB.prepare(
+      `INSERT INTO activity_log (user_id, action, entity_type, entity_id, details, ip)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(userId || null, action, entityType || null, entityId || null,
+      details ? (typeof details === "string" ? details : JSON.stringify(details)) : null,
+      ip || null).run();
+  } catch (e) { /* لا نُفشل العملية بسبب فشل التسجيل */ }
+}
+
+async function notify(env, userId, title, body, link) {
+  if (!userId) return;
+  try {
+    await env.DB.prepare(
+      `INSERT INTO notifications (user_id, title, body, link) VALUES (?, ?, ?, ?)`
+    ).bind(userId, title, body || null, link || null).run();
+  } catch (e) { /* تجاهل */ }
+}
+
+// ---- حدّ المحاولات (مكافحة brute-force) ----
+const RL_WINDOW_MIN = 15;   // نافذة العدّ بالدقائق
+const RL_LOCK_MIN = 15;     // مدة القفل بالدقائق
+
+async function isLocked(env, key) {
+  try {
+    const row = await env.DB.prepare(`SELECT locked_until FROM rate_limits WHERE rl_key=?`).bind(key).first();
+    if (!row || !row.locked_until) return false;
+    return new Date(row.locked_until.replace(" ", "T") + "Z").getTime() > Date.now();
+  } catch { return false; }
+}
+
+async function registerFailure(env, key, maxAttempts) {
+  try {
+    const row = await env.DB.prepare(`SELECT count, window_start FROM rate_limits WHERE rl_key=?`).bind(key).first();
+    if (!row) {
+      await env.DB.prepare(`INSERT INTO rate_limits (rl_key, count, window_start) VALUES (?, 1, datetime('now'))`).bind(key).run();
+      return;
+    }
+    const windowStart = new Date(row.window_start.replace(" ", "T") + "Z").getTime();
+    if (Date.now() - windowStart > RL_WINDOW_MIN * 60000) {
+      // انتهت النافذة → إعادة العدّ
+      await env.DB.prepare(`UPDATE rate_limits SET count=1, window_start=datetime('now'), locked_until=NULL WHERE rl_key=?`).bind(key).run();
+      return;
+    }
+    const newCount = (row.count || 0) + 1;
+    if (newCount >= maxAttempts) {
+      await env.DB.prepare(`UPDATE rate_limits SET count=?, locked_until=datetime('now', ?) WHERE rl_key=?`).bind(newCount, `+${RL_LOCK_MIN} minutes`, key).run();
+    } else {
+      await env.DB.prepare(`UPDATE rate_limits SET count=? WHERE rl_key=?`).bind(newCount, key).run();
+    }
+  } catch { /* لا نُفشل الطلب بسبب فشل العدّ */ }
+}
+
+async function clearLimit(env, key) {
+  try { await env.DB.prepare(`DELETE FROM rate_limits WHERE rl_key=?`).bind(key).run(); } catch {}
+}
+
+async function nextShipmentRef(env) {
+  const year = new Date().getFullYear();
+  const counterName = `shipment_${year}`;
+  await env.DB.prepare(
+    `INSERT INTO counters (name, value) VALUES (?, 1)
+     ON CONFLICT(name) DO UPDATE SET value = value + 1`
+  ).bind(counterName).run();
+  const row = await env.DB.prepare(`SELECT value FROM counters WHERE name = ?`).bind(counterName).first();
+  const seq = String(row.value).padStart(4, "0");
+  return `MSR-${year}-${seq}`;
+}
+
+function sanitizeUser(u) {
+  if (!u) return null;
+  const { password_hash, ...safe } = u;
+  return safe;
+}
+
+function num(v) {
+  if (v == null || v === "") return 0;
+  const n = Number(v);
+  return isNaN(n) ? 0 : n;
+}
+
+// تحويل آمن للقيم المنطقية (يتعامل مع "0"/"1"/"true"/"false")
+function truthy(v) {
+  return v === true || v === 1 || v === "1" || v === "true";
+}
+
+// =====================================================================
+//  الصلاحيات (RBAC)
+// =====================================================================
+const PERM = {
+  manageUsers:    ["admin", "manager"],
+  writeShipments: ["admin", "manager", "logistics"],
+  deleteShipments:["admin", "manager"],
+  writeSuppliers: ["admin", "manager", "logistics"],
+  writeClients: ["admin", "manager", "logistics"],
+  writeDocuments: ["admin", "manager", "logistics", "customs", "transport"],
+  writeCustoms:   ["admin", "manager", "customs"],
+  writeCustomsOps:["admin", "manager", "customs"],
+  writeTransport: ["admin", "manager", "transport"],
+  writeFinance:   ["admin", "manager", "accounting"],
+  writeCarriers:  ["admin", "manager", "transport", "logistics"],
+  writePenalties: ["admin", "manager", "accounting", "logistics", "customs"],
+  viewReports:    ["admin", "manager", "accounting"],
+  comment:        ["admin", "manager", "logistics", "customs", "transport", "accounting"],
+};
+
+function can(user, perm) {
+  if (!user) return false;
+  if (user.role === "admin") return true;
+  return (PERM[perm] || []).includes(user.role);
+}
+
+// =====================================================================
+//  المصادقة: استخراج المستخدم من التوكن
+// =====================================================================
+async function authenticate(request, env) {
+  const auth = request.headers.get("Authorization") || "";
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  if (!m) return null;
+  const secret = env.JWT_SECRET;
+  if (!secret) return null;
+  const payload = await verifyJWT(m[1], secret);
+  if (!payload || !payload.sub) return null;
+  const user = await env.DB.prepare(
+    `SELECT * FROM users WHERE id = ? AND active = 1`
+  ).bind(payload.sub).first();
+  return user || null;
+}
+
+// =====================================================================
+//  مُوجِّه الطلبات (Router)
+// =====================================================================
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const origin = request.headers.get("Origin");
+    const corsHeaders = cors(origin);
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: corsHeaders });
+    }
+
+    let response;
+    try {
+      response = await route(request, env, url);
+    } catch (e) {
+      response = err("خطأ داخلي في الخادم: " + (e?.message || e), 500);
+    }
+
+    // إضافة ترويسات CORS + الأمان لكل استجابة
+    const headers = new Headers(response.headers);
+    for (const [k, v] of Object.entries(corsHeaders)) headers.set(k, v);
+    headers.set("X-Content-Type-Options", "nosniff");
+    headers.set("X-Frame-Options", "DENY");
+    headers.set("Referrer-Policy", "strict-origin-when-cross-origin");
+    headers.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+    return new Response(response.body, { status: response.status, headers });
+  },
+};
+
+async function route(request, env, url) {
+  const path = url.pathname.replace(/\/+$/, "") || "/";
+  const method = request.method;
+  const ip = request.headers.get("CF-Connecting-IP") || "";
+
+  // ---------- الصحة ----------
+  if (path === "/api/health") {
+    let db = "unknown";
+    try { await env.DB.prepare("SELECT 1").first(); db = "ok"; } catch { db = "error"; }
+    return ok({ service: "MASAR API", version: "1.0.0", db, time: new Date().toISOString() });
+  }
+
+  // ---------- الإعداد الأولي: إنشاء أول مدير ----------
+  if (path === "/api/setup" && method === "POST") {
+    return handleSetup(request, env);
+  }
+
+  // ---------- تسجيل الدخول ----------
+  if (path === "/api/auth/login" && method === "POST") {
+    return handleLogin(request, env, ip);
+  }
+
+  // كل ما بعده يتطلب مصادقة
+  const user = await authenticate(request, env);
+  if (!user) return err("غير مصرّح — سجّل الدخول", 401);
+
+  // فرض تغيير كلمة المرور المؤقتة قبل أي عملية أخرى
+  if (user.must_change && !(path === "/api/auth/me" || path === "/api/auth/change-password")) {
+    return err("يجب تغيير كلمة المرور قبل المتابعة", 403, { must_change: true });
+  }
+
+  // ---------- معلومات المستخدم الحالي ----------
+  if (path === "/api/auth/me" && method === "GET") {
+    return ok({ user: sanitizeUser(user) });
+  }
+  if (path === "/api/auth/change-password" && method === "POST") {
+    return handleChangePassword(request, env, user);
+  }
+
+  // ---------- المستخدمون ----------
+  if (path === "/api/users") {
+    if (method === "GET") return listUsers(env, user);
+    if (method === "POST") return createUser(request, env, user, ip);
+  }
+  let m;
+  if ((m = path.match(/^\/api\/users\/(\d+)$/))) {
+    const id = +m[1];
+    if (method === "PUT") return updateUser(request, env, user, id, ip);
+    if (method === "DELETE") return deactivateUser(env, user, id, ip);
+  }
+  if ((m = path.match(/^\/api\/users\/(\d+)\/reset-password$/)) && method === "POST") {
+    return resetUserPassword(request, env, user, +m[1], ip);
+  }
+
+  // ---------- الموردون ----------
+  if (path === "/api/suppliers") {
+    if (method === "GET") return listSuppliers(env);
+    if (method === "POST") return createSupplier(request, env, user, ip);
+  }
+  if ((m = path.match(/^\/api\/suppliers\/(\d+)$/))) {
+    const id = +m[1];
+    if (method === "PUT") return updateSupplier(request, env, user, id, ip);
+    if (method === "DELETE") return deleteSupplier(env, user, id, ip);
+  }
+
+  // ---------- العملاء ----------
+  if (path === "/api/clients") {
+    if (method === "GET") return listClients(env);
+    if (method === "POST") return createClient(request, env, user, ip);
+  }
+  if ((m = path.match(/^\/api\/clients\/(\d+)$/))) {
+    const id = +m[1];
+    if (method === "PUT") return updateClient(request, env, user, id, ip);
+    if (method === "DELETE") return deleteClient(env, user, id, ip);
+  }
+
+  // ---------- الشحنات ----------
+  if (path === "/api/shipments") {
+    if (method === "GET") return listShipments(request, env, url);
+    if (method === "POST") return createShipment(request, env, user, ip);
+  }
+  if ((m = path.match(/^\/api\/shipments\/(\d+)$/))) {
+    const id = +m[1];
+    if (method === "GET") return getShipment(env, id);
+    if (method === "PUT") return updateShipment(request, env, user, id, ip);
+    if (method === "DELETE") return deleteShipment(env, user, id, ip);
+  }
+  if ((m = path.match(/^\/api\/shipments\/(\d+)\/status$/)) && method === "POST") {
+    return changeShipmentStatus(request, env, user, +m[1], ip);
+  }
+  if ((m = path.match(/^\/api\/shipments\/(\d+)\/timeline$/)) && method === "GET") {
+    return shipmentTimeline(env, +m[1]);
+  }
+  if ((m = path.match(/^\/api\/shipments\/(\d+)\/milestones$/)) && method === "PUT") {
+    return updateMilestones(request, env, user, +m[1], ip);
+  }
+  if ((m = path.match(/^\/api\/shipments\/(\d+)\/cargo$/)) && method === "PUT") {
+    return updateCargo(request, env, user, +m[1], ip);
+  }
+  if ((m = path.match(/^\/api\/shipments\/(\d+)\/reexport$/)) && method === "PUT") {
+    return updateReexport(request, env, user, +m[1], ip);
+  }
+  if ((m = path.match(/^\/api\/shipments\/(\d+)\/penalties$/)) && method === "GET") {
+    return listShipmentPenalties(env, +m[1]);
+  }
+  if ((m = path.match(/^\/api\/shipments\/(\d+)\/updates$/))) {
+    const id = +m[1];
+    if (method === "GET") return listStatusUpdates(env, id);
+    if (method === "POST") return addStatusUpdate(request, env, user, id, ip);
+  }
+  if (path === "/api/alerts" && method === "GET") return alerts(env, user);
+
+  // ---------- المستندات ----------
+  if ((m = path.match(/^\/api\/shipments\/(\d+)\/documents$/))) {
+    const id = +m[1];
+    if (method === "GET") return listDocuments(env, id);
+    if (method === "POST") return uploadDocument(request, env, user, id, ip);
+  }
+  if ((m = path.match(/^\/api\/shipments\/(\d+)\/document-link$/)) && method === "POST") {
+    return addDocumentLink(request, env, user, +m[1], ip);
+  }
+  if ((m = path.match(/^\/api\/documents\/(\d+)\/download$/)) && method === "GET") {
+    return downloadDocument(env, +m[1]);
+  }
+  if ((m = path.match(/^\/api\/documents\/(\d+)$/)) && method === "DELETE") {
+    return deleteDocument(env, user, +m[1], ip);
+  }
+
+  // ---------- التعليقات ----------
+  if ((m = path.match(/^\/api\/shipments\/(\d+)\/comments$/))) {
+    const id = +m[1];
+    if (method === "GET") return listComments(env, id);
+    if (method === "POST") return addComment(request, env, user, id, ip);
+  }
+
+  // ---------- التخليص الكمركي ----------
+  if ((m = path.match(/^\/api\/shipments\/(\d+)\/customs$/)) && method === "POST") {
+    return saveCustoms(request, env, user, +m[1], ip);
+  }
+  if (path === "/api/customs/queue" && method === "GET") return customsQueue(env, user);
+
+  // ---------- عمليات الكمارك (CD/LB) ----------
+  if (path === "/api/customs-ops") {
+    if (method === "GET") return listCustomsOps(env, user);
+    if (method === "POST") return createCustomsOp(request, env, user, ip);
+  }
+  if ((m = path.match(/^\/api\/customs-ops\/(\d+)$/))) {
+    const id = +m[1];
+    if (method === "GET") return getCustomsOp(env, id);
+    if (method === "PUT") return updateCustomsOp(request, env, user, id, ip);
+    if (method === "DELETE") return deleteCustomsOp(env, user, id, ip);
+  }
+
+  // ---------- النقل ----------
+  if ((m = path.match(/^\/api\/shipments\/(\d+)\/transport$/))) {
+    const id = +m[1];
+    if (method === "GET") return listTransport(env, id);
+    if (method === "POST") return createTransport(request, env, user, id, ip);
+  }
+  if ((m = path.match(/^\/api\/transport\/(\d+)$/))) {
+    const tid = +m[1];
+    if (method === "PUT") return updateTransport(request, env, user, tid, ip);
+    if (method === "DELETE") return deleteTransport(env, user, tid, ip);
+  }
+  if (path === "/api/transport/queue" && method === "GET") return transportQueue(env, user);
+
+  // ---------- الحسابات ----------
+  if ((m = path.match(/^\/api\/shipments\/(\d+)\/finance$/))) {
+    const id = +m[1];
+    if (method === "GET") return listFinance(env, id);
+    if (method === "POST") return createFinance(request, env, user, id, ip);
+  }
+  if ((m = path.match(/^\/api\/finance\/(\d+)$/))) {
+    const fid = +m[1];
+    if (method === "PUT") return updateFinance(request, env, user, fid, ip);
+    if (method === "DELETE") return deleteFinance(env, user, fid, ip);
+  }
+  if (path === "/api/finance/overview" && method === "GET") return financeOverview(request, env, user, url);
+
+  // ---------- الناقلون ----------
+  if (path === "/api/carriers") {
+    if (method === "GET") return listCarriers(env);
+    if (method === "POST") return createCarrier(request, env, user, ip);
+  }
+  if ((m = path.match(/^\/api\/carriers\/(\d+)$/))) {
+    const id = +m[1];
+    if (method === "PUT") return updateCarrier(request, env, user, id, ip);
+    if (method === "DELETE") return deleteCarrier(env, user, id, ip);
+  }
+
+  // ---------- الغرامات ----------
+  if (path === "/api/penalties") {
+    if (method === "GET") return listPenalties(env, user);
+    if (method === "POST") return createPenalty(request, env, user, ip);
+  }
+  if ((m = path.match(/^\/api\/penalties\/(\d+)$/))) {
+    const id = +m[1];
+    if (method === "PUT") return updatePenalty(request, env, user, id, ip);
+    if (method === "DELETE") return deletePenalty(env, user, id, ip);
+  }
+
+  // ---------- الإشعارات ----------
+  if (path === "/api/notifications" && method === "GET") return listNotifications(env, user);
+  if (path === "/api/notifications/read-all" && method === "POST") return readAllNotifications(env, user);
+  if ((m = path.match(/^\/api\/notifications\/(\d+)\/read$/)) && method === "POST") {
+    return readNotification(env, user, +m[1]);
+  }
+
+  // ---------- لوحة المعلومات ----------
+  if (path === "/api/dashboard" && method === "GET") return dashboard(env, user);
+
+  // ---------- التقارير ----------
+  if (path === "/api/reports" && method === "GET") return reports(env, user);
+
+  // ---------- سجل النشاط ----------
+  if (path === "/api/activity" && method === "GET") return listActivity(request, env, user, url);
+
+  return err("المسار غير موجود", 404);
+}
+
+// =====================================================================
+//  المعالجات: المصادقة والإعداد
+// =====================================================================
+async function handleSetup(request, env) {
+  const body = await request.json().catch(() => ({}));
+  const { token, full_name, username, password } = body;
+  if (!env.SETUP_TOKEN) return err("SETUP_TOKEN غير مضبوط على الخادم", 500);
+  if ((token || "").trim() !== env.SETUP_TOKEN.trim()) return err("توكن الإعداد غير صحيح", 403);
+
+  const count = await env.DB.prepare(`SELECT COUNT(*) AS c FROM users`).first();
+  if (count.c > 0) return err("الإعداد تمّ مسبقاً — يوجد مستخدمون", 409);
+  if (!full_name || !username || !password || password.length < 8) {
+    return err("الاسم واسم المستخدم وكلمة مرور (8 أحرف فأكثر) مطلوبة", 400);
+  }
+
+  const hash = await hashPassword(password);
+  const res = await env.DB.prepare(
+    `INSERT INTO users (full_name, username, password_hash, role, department, active)
+     VALUES (?, ?, ?, 'admin', 'الإدارة', 1)`
+  ).bind(full_name, username, hash).run();
+  await env.DB.prepare(`UPDATE settings SET value='1' WHERE key='setup_done'`).run();
+  await logActivity(env, { userId: res.meta.last_row_id, action: "setup", entityType: "user", entityId: res.meta.last_row_id });
+  return ok({ message: "تم إنشاء المدير الأول", user_id: res.meta.last_row_id });
+}
+
+async function handleLogin(request, env, ip) {
+  if (!env.JWT_SECRET) return err("JWT_SECRET غير مضبوط على الخادم", 500);
+  const { username, password } = await request.json().catch(() => ({}));
+  if (!username || !password) return err("اسم المستخدم وكلمة المرور مطلوبان", 400);
+
+  // حدّ المحاولات: قفل بعد 5 محاولات فاشلة للمستخدم أو 15 لعنوان IP خلال 15 دقيقة
+  const ipKey = `login:ip:${ip || "unknown"}`;
+  const userKey = `login:user:${String(username).toLowerCase()}`;
+  if (await isLocked(env, userKey) || await isLocked(env, ipKey)) {
+    await logActivity(env, { userId: null, action: "login_locked", entityType: "user", details: username, ip });
+    return err("تم تجاوز عدد محاولات الدخول المسموح. الرجاء المحاولة بعد 15 دقيقة.", 429);
+  }
+
+  const user = await env.DB.prepare(
+    `SELECT * FROM users WHERE username = ? AND active = 1`
+  ).bind(username).first();
+
+  // التحقق دائماً (لتفادي تسريب وجود المستخدم عبر التوقيت)
+  const valid = user ? await verifyPassword(password, user.password_hash) : await verifyPassword(password, "pbkdf2:1:x:y");
+  if (!user || !valid) {
+    await registerFailure(env, userKey, 5);
+    await registerFailure(env, ipKey, 15);
+    await logActivity(env, { userId: user?.id, action: "login_failed", entityType: "user", details: username, ip });
+    return err("بيانات الدخول غير صحيحة", 401);
+  }
+
+  // نجاح → تصفير عدّادات المحاولات
+  await clearLimit(env, userKey);
+  await clearLimit(env, ipKey);
+  await env.DB.prepare(`UPDATE users SET last_login = datetime('now') WHERE id = ?`).bind(user.id).run();
+  const token = await signJWT({ sub: user.id, role: user.role, name: user.full_name }, env.JWT_SECRET);
+  await logActivity(env, { userId: user.id, action: "login", entityType: "user", entityId: user.id, ip });
+  return ok({ token, user: sanitizeUser(user) });
+}
+
+async function handleChangePassword(request, env, user) {
+  const { old_password, new_password } = await request.json().catch(() => ({}));
+  if (!new_password || new_password.length < 8) return err("كلمة المرور الجديدة 8 أحرف فأكثر", 400);
+  const valid = await verifyPassword(old_password || "", user.password_hash);
+  if (!valid) return err("كلمة المرور الحالية غير صحيحة", 403);
+  const hash = await hashPassword(new_password);
+  await env.DB.prepare(`UPDATE users SET password_hash=?, must_change=0, updated_at=datetime('now') WHERE id=?`)
+    .bind(hash, user.id).run();
+  await logActivity(env, { userId: user.id, action: "change_password", entityType: "user", entityId: user.id });
+  return ok({ message: "تم تغيير كلمة المرور" });
+}
+
+// =====================================================================
+//  المستخدمون
+// =====================================================================
+async function listUsers(env, user) {
+  if (!can(user, "manageUsers")) return err("لا تملك صلاحية", 403);
+  const { results } = await env.DB.prepare(
+    `SELECT id, full_name, username, email, phone, role, department, active, last_login, created_at
+     FROM users ORDER BY id DESC`
+  ).all();
+  return ok({ users: results });
+}
+
+async function createUser(request, env, user, ip) {
+  if (!can(user, "manageUsers")) return err("لا تملك صلاحية", 403);
+  const b = await request.json().catch(() => ({}));
+  if (!b.full_name || !b.username || !b.password || b.password.length < 8) {
+    return err("الاسم واسم المستخدم وكلمة مرور (8 أحرف فأكثر) مطلوبة", 400);
+  }
+  if (!ROLES.includes(b.role)) return err("الدور غير صحيح", 400);
+  const exists = await env.DB.prepare(`SELECT id FROM users WHERE username=?`).bind(b.username).first();
+  if (exists) return err("اسم المستخدم مستخدم مسبقاً", 409);
+  const hash = await hashPassword(b.password);
+  try {
+    const res = await env.DB.prepare(
+      `INSERT INTO users (full_name, username, email, phone, password_hash, role, department, must_change, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)`
+    ).bind(b.full_name, b.username, b.email || null, b.phone || null, hash, b.role, b.department || null, user.id).run();
+    await logActivity(env, { userId: user.id, action: "create", entityType: "user", entityId: res.meta.last_row_id, details: b.username, ip });
+    return ok({ id: res.meta.last_row_id, message: "تم إنشاء المستخدم" });
+  } catch (e) {
+    return err("تعذّر إنشاء المستخدم: " + e.message, 400);
+  }
+}
+
+async function updateUser(request, env, user, id, ip) {
+  if (!can(user, "manageUsers")) return err("لا تملك صلاحية", 403);
+  const b = await request.json().catch(() => ({}));
+  const target = await env.DB.prepare(`SELECT * FROM users WHERE id=?`).bind(id).first();
+  if (!target) return err("المستخدم غير موجود", 404);
+  if (b.role && !ROLES.includes(b.role)) return err("الدور غير صحيح", 400);
+  await env.DB.prepare(
+    `UPDATE users SET full_name=?, email=?, phone=?, role=?, department=?, active=?, updated_at=datetime('now') WHERE id=?`
+  ).bind(
+    b.full_name ?? target.full_name,
+    b.email ?? target.email,
+    b.phone ?? target.phone,
+    b.role ?? target.role,
+    b.department ?? target.department,
+    b.active != null ? (b.active ? 1 : 0) : target.active,
+    id
+  ).run();
+  await logActivity(env, { userId: user.id, action: "update", entityType: "user", entityId: id, ip });
+  return ok({ message: "تم تحديث المستخدم" });
+}
+
+async function deactivateUser(env, user, id, ip) {
+  if (!can(user, "manageUsers")) return err("لا تملك صلاحية", 403);
+  if (id === user.id) return err("لا يمكنك تعطيل حسابك", 400);
+  await env.DB.prepare(`UPDATE users SET active=0, updated_at=datetime('now') WHERE id=?`).bind(id).run();
+  await logActivity(env, { userId: user.id, action: "deactivate", entityType: "user", entityId: id, ip });
+  return ok({ message: "تم تعطيل المستخدم" });
+}
+
+async function resetUserPassword(request, env, user, id, ip) {
+  if (!can(user, "manageUsers")) return err("لا تملك صلاحية", 403);
+  const { new_password } = await request.json().catch(() => ({}));
+  if (!new_password || new_password.length < 8) return err("كلمة المرور 8 أحرف فأكثر", 400);
+  const hash = await hashPassword(new_password);
+  await env.DB.prepare(`UPDATE users SET password_hash=?, must_change=1, updated_at=datetime('now') WHERE id=?`)
+    .bind(hash, id).run();
+  await logActivity(env, { userId: user.id, action: "reset_password", entityType: "user", entityId: id, ip });
+  return ok({ message: "تم تعيين كلمة مرور جديدة" });
+}
+
+// =====================================================================
+//  الموردون
+// =====================================================================
+async function listSuppliers(env) {
+  const { results } = await env.DB.prepare(
+    `SELECT * FROM suppliers ORDER BY name COLLATE NOCASE`
+  ).all();
+  return ok({ suppliers: results });
+}
+
+async function createSupplier(request, env, user, ip) {
+  if (!can(user, "writeSuppliers")) return err("لا تملك صلاحية", 403);
+  const b = await request.json().catch(() => ({}));
+  if (!b.name) return err("اسم المورد مطلوب", 400);
+  const res = await env.DB.prepare(
+    `INSERT INTO suppliers (name, country, contact, email, phone, address, notes, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(b.name, b.country || null, b.contact || null, b.email || null, b.phone || null, b.address || null, b.notes || null, user.id).run();
+  await logActivity(env, { userId: user.id, action: "create", entityType: "supplier", entityId: res.meta.last_row_id, details: b.name, ip });
+  return ok({ id: res.meta.last_row_id, message: "تم إضافة المورد" });
+}
+
+async function updateSupplier(request, env, user, id, ip) {
+  if (!can(user, "writeSuppliers")) return err("لا تملك صلاحية", 403);
+  const b = await request.json().catch(() => ({}));
+  const t = await env.DB.prepare(`SELECT * FROM suppliers WHERE id=?`).bind(id).first();
+  if (!t) return err("المورد غير موجود", 404);
+  await env.DB.prepare(
+    `UPDATE suppliers SET name=?, country=?, contact=?, email=?, phone=?, address=?, notes=?, active=?, updated_at=datetime('now') WHERE id=?`
+  ).bind(
+    b.name ?? t.name, b.country ?? t.country, b.contact ?? t.contact, b.email ?? t.email,
+    b.phone ?? t.phone, b.address ?? t.address, b.notes ?? t.notes,
+    b.active != null ? (b.active ? 1 : 0) : t.active, id
+  ).run();
+  await logActivity(env, { userId: user.id, action: "update", entityType: "supplier", entityId: id, ip });
+  return ok({ message: "تم تحديث المورد" });
+}
+
+async function deleteSupplier(env, user, id, ip) {
+  if (!can(user, "writeSuppliers")) return err("لا تملك صلاحية", 403);
+  // حذف ناعم
+  await env.DB.prepare(`UPDATE suppliers SET active=0, updated_at=datetime('now') WHERE id=?`).bind(id).run();
+  await logActivity(env, { userId: user.id, action: "delete", entityType: "supplier", entityId: id, ip });
+  return ok({ message: "تم حذف المورد" });
+}
+
+// =====================================================================
+//  العملاء (شركات النفط المخدومة)
+// =====================================================================
+async function listClients(env) {
+  const { results } = await env.DB.prepare(`SELECT * FROM clients ORDER BY name COLLATE NOCASE`).all();
+  return ok({ clients: results });
+}
+
+async function createClient(request, env, user, ip) {
+  if (!can(user, "writeClients")) return err("لا تملك صلاحية", 403);
+  const b = await request.json().catch(() => ({}));
+  if (!b.name) return err("اسم العميل مطلوب", 400);
+  const res = await env.DB.prepare(
+    `INSERT INTO clients (name, code, contact, email, phone, address, notes, created_by)
+     VALUES (?,?,?,?,?,?,?,?)`
+  ).bind(b.name, b.code || null, b.contact || null, b.email || null, b.phone || null, b.address || null, b.notes || null, user.id).run();
+  await logActivity(env, { userId: user.id, action: "create", entityType: "client", entityId: res.meta.last_row_id, details: b.name, ip });
+  return ok({ id: res.meta.last_row_id, message: "تم إضافة العميل" });
+}
+
+async function updateClient(request, env, user, id, ip) {
+  if (!can(user, "writeClients")) return err("لا تملك صلاحية", 403);
+  const b = await request.json().catch(() => ({}));
+  const t = await env.DB.prepare(`SELECT * FROM clients WHERE id=?`).bind(id).first();
+  if (!t) return err("العميل غير موجود", 404);
+  await env.DB.prepare(
+    `UPDATE clients SET name=?, code=?, contact=?, email=?, phone=?, address=?, notes=?, active=?, updated_at=datetime('now') WHERE id=?`
+  ).bind(
+    b.name ?? t.name, b.code ?? t.code, b.contact ?? t.contact, b.email ?? t.email,
+    b.phone ?? t.phone, b.address ?? t.address, b.notes ?? t.notes,
+    b.active != null ? (b.active ? 1 : 0) : t.active, id
+  ).run();
+  await logActivity(env, { userId: user.id, action: "update", entityType: "client", entityId: id, ip });
+  return ok({ message: "تم تحديث العميل" });
+}
+
+async function deleteClient(env, user, id, ip) {
+  if (!can(user, "writeClients")) return err("لا تملك صلاحية", 403);
+  await env.DB.prepare(`UPDATE clients SET active=0, updated_at=datetime('now') WHERE id=?`).bind(id).run();
+  await logActivity(env, { userId: user.id, action: "delete", entityType: "client", entityId: id, ip });
+  return ok({ message: "تم حذف العميل" });
+}
+
+// =====================================================================
+//  الشحنات
+// =====================================================================
+async function listShipments(request, env, url) {
+  const status = url.searchParams.get("status");
+  const q = url.searchParams.get("q");
+  const supplierId = url.searchParams.get("supplier_id");
+  const clientId = url.searchParams.get("client_id");
+  const assigned = url.searchParams.get("assigned_to");
+  const page = Math.max(1, parseInt(url.searchParams.get("page") || "1", 10));
+  const limit = Math.min(100, parseInt(url.searchParams.get("limit") || "25", 10));
+  const offset = (page - 1) * limit;
+
+  const where = [];
+  const args = [];
+  if (status && SHIPMENT_STATUSES.includes(status)) { where.push("s.status = ?"); args.push(status); }
+  if (supplierId) { where.push("s.supplier_id = ?"); args.push(+supplierId); }
+  if (clientId) { where.push("s.client_id = ?"); args.push(+clientId); }
+  if (assigned) { where.push("s.assigned_to = ?"); args.push(+assigned); }
+  if (q) {
+    where.push("(s.ref_no LIKE ? OR s.title LIKE ? OR s.bl_no LIKE ? OR s.container_no LIKE ? OR s.goods_description LIKE ? OR s.call_off LIKE ?)");
+    const like = `%${q}%`;
+    args.push(like, like, like, like, like, like);
+  }
+  const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+  const countRow = await env.DB.prepare(`SELECT COUNT(*) AS c FROM shipments s ${whereSql}`).bind(...args).first();
+  const { results } = await env.DB.prepare(
+    `SELECT s.*, sup.name AS supplier_name, cl.name AS client_name, u.full_name AS assigned_name
+     FROM shipments s
+     LEFT JOIN suppliers sup ON sup.id = s.supplier_id
+     LEFT JOIN clients cl ON cl.id = s.client_id
+     LEFT JOIN users u ON u.id = s.assigned_to
+     ${whereSql}
+     ORDER BY s.created_at DESC
+     LIMIT ? OFFSET ?`
+  ).bind(...args, limit, offset).all();
+
+  return ok({ shipments: results, total: countRow.c, page, limit });
+}
+
+async function getShipment(env, id) {
+  const s = await env.DB.prepare(
+    `SELECT s.*, sup.name AS supplier_name, sup.country AS supplier_country,
+            cl.name AS client_name, cl.code AS client_code,
+            u.full_name AS assigned_name, c.full_name AS created_name
+     FROM shipments s
+     LEFT JOIN suppliers sup ON sup.id = s.supplier_id
+     LEFT JOIN clients cl ON cl.id = s.client_id
+     LEFT JOIN users u ON u.id = s.assigned_to
+     LEFT JOIN users c ON c.id = s.created_by
+     WHERE s.id = ?`
+  ).bind(id).first();
+  if (!s) return err("الشحنة غير موجودة", 404);
+
+  const docs = (await env.DB.prepare(
+    `SELECT d.*, u.full_name AS uploaded_name FROM shipment_documents d
+     LEFT JOIN users u ON u.id = d.uploaded_by WHERE d.shipment_id=? ORDER BY d.uploaded_at DESC`
+  ).bind(id).all()).results;
+
+  const customs = await env.DB.prepare(`SELECT * FROM customs_declarations WHERE shipment_id=? ORDER BY id DESC LIMIT 1`).bind(id).first();
+  const transport = (await env.DB.prepare(`SELECT * FROM transport_orders WHERE shipment_id=? ORDER BY id DESC`).bind(id).all()).results;
+  const finance = (await env.DB.prepare(`SELECT * FROM finance_records WHERE shipment_id=? ORDER BY id DESC`).bind(id).all()).results;
+
+  const financeSummary = finance.reduce((acc, r) => {
+    if (r.type === "cost") acc.total_cost += r.amount || 0;
+    if (r.type === "payment") acc.total_paid += r.amount || 0;
+    return acc;
+  }, { total_cost: 0, total_paid: 0 });
+
+  return ok({ shipment: s, documents: docs, customs, transport, finance, finance_summary: financeSummary });
+}
+
+async function createShipment(request, env, user, ip) {
+  if (!can(user, "writeShipments")) return err("لا تملك صلاحية إنشاء شحنة", 403);
+  const b = await request.json().catch(() => ({}));
+  if (!b.title) return err("عنوان الشحنة مطلوب", 400);
+  const status = SHIPMENT_STATUSES.includes(b.status) ? b.status : "opened";
+  const refNo = await nextShipmentRef(env);
+  const res = await env.DB.prepare(
+    `INSERT INTO shipments
+       (ref_no, title, client_id, supplier_id, call_off, call_off_date, importation_type,
+        status, priority, transport_mode, incoterm, shipping_line, shipping_agent,
+        vessel_name, voyage_no, vessel_ata, berth_no,
+        origin_country, origin_port, destination, goods_description, quantity, unit,
+        weight_kg, container_no, bl_no, currency, goods_value, etd, eta,
+        assigned_to, created_by)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).bind(
+    refNo, b.title, b.client_id || null, b.supplier_id || null, b.call_off || null,
+    b.call_off_date || null, b.importation_type || null, status, b.priority || "normal",
+    b.transport_mode || null, b.incoterm || null, b.shipping_line || null, b.shipping_agent || null,
+    b.vessel_name || null, b.voyage_no || null, b.vessel_ata || null, b.berth_no || null,
+    b.origin_country || null, b.origin_port || null, b.destination || null, b.goods_description || null,
+    b.quantity || null, b.unit || null, b.weight_kg || null, b.container_no || null,
+    b.bl_no || null, b.currency || "USD", b.goods_value || null, b.etd || null,
+    b.eta || null, b.assigned_to || null, user.id
+  ).run();
+  const id = res.meta.last_row_id;
+  await logActivity(env, { userId: user.id, action: "create", entityType: "shipment", entityId: id, details: refNo, ip });
+  if (b.assigned_to && b.assigned_to !== user.id) {
+    await notify(env, b.assigned_to, "تم إسناد شحنة إليك", `${refNo} — ${b.title}`, `#/shipments/${id}`);
+  }
+  return ok({ id, ref_no: refNo, message: "تم إنشاء الشحنة" });
+}
+
+async function updateShipment(request, env, user, id, ip) {
+  if (!can(user, "writeShipments")) return err("لا تملك صلاحية", 403);
+  const b = await request.json().catch(() => ({}));
+  const t = await env.DB.prepare(`SELECT * FROM shipments WHERE id=?`).bind(id).first();
+  if (!t) return err("الشحنة غير موجودة", 404);
+  await env.DB.prepare(
+    `UPDATE shipments SET title=?, client_id=?, supplier_id=?, call_off=?, call_off_date=?, importation_type=?,
+       priority=?, transport_mode=?, incoterm=?, shipping_line=?, shipping_agent=?,
+       vessel_name=?, voyage_no=?, vessel_ata=?, berth_no=?,
+       origin_country=?, origin_port=?, destination=?, goods_description=?, quantity=?, unit=?,
+       weight_kg=?, container_no=?, bl_no=?, currency=?, goods_value=?, etd=?, eta=?,
+       arrival_date=?, assigned_to=?, notes=?, updated_at=datetime('now')
+     WHERE id=?`
+  ).bind(
+    b.title ?? t.title, b.client_id ?? t.client_id, b.supplier_id ?? t.supplier_id,
+    b.call_off ?? t.call_off, b.call_off_date ?? t.call_off_date, b.importation_type ?? t.importation_type,
+    b.priority ?? t.priority, b.transport_mode ?? t.transport_mode, b.incoterm ?? t.incoterm,
+    b.shipping_line ?? t.shipping_line, b.shipping_agent ?? t.shipping_agent,
+    b.vessel_name ?? t.vessel_name, b.voyage_no ?? t.voyage_no, b.vessel_ata ?? t.vessel_ata, b.berth_no ?? t.berth_no,
+    b.origin_country ?? t.origin_country, b.origin_port ?? t.origin_port,
+    b.destination ?? t.destination, b.goods_description ?? t.goods_description,
+    b.quantity ?? t.quantity, b.unit ?? t.unit, b.weight_kg ?? t.weight_kg,
+    b.container_no ?? t.container_no, b.bl_no ?? t.bl_no, b.currency ?? t.currency,
+    b.goods_value ?? t.goods_value, b.etd ?? t.etd, b.eta ?? t.eta,
+    b.arrival_date ?? t.arrival_date, b.assigned_to ?? t.assigned_to, b.notes ?? t.notes, id
+  ).run();
+  await logActivity(env, { userId: user.id, action: "update", entityType: "shipment", entityId: id, details: t.ref_no, ip });
+  return ok({ message: "تم تحديث الشحنة" });
+}
+
+async function changeShipmentStatus(request, env, user, id, ip) {
+  if (!can(user, "writeShipments") && !can(user, "writeCustoms") && !can(user, "writeTransport")) {
+    return err("لا تملك صلاحية", 403);
+  }
+  const { status } = await request.json().catch(() => ({}));
+  if (!SHIPMENT_STATUSES.includes(status)) return err("حالة غير صحيحة", 400);
+  const t = await env.DB.prepare(`SELECT * FROM shipments WHERE id=?`).bind(id).first();
+  if (!t) return err("الشحنة غير موجودة", 404);
+
+  const stamps = {};
+  if (status === "at_port" && !t.arrival_date) stamps.arrival_date = "datetime('now')";
+  let extra = "";
+  if (status === "delivered") extra = ", delivered_date=datetime('now')";
+  if (status === "closed") extra = ", closed_date=datetime('now')";
+
+  await env.DB.prepare(`UPDATE shipments SET status=?${extra}, updated_at=datetime('now') WHERE id=?`).bind(status, id).run();
+  await logActivity(env, { userId: user.id, action: "status_change", entityType: "shipment", entityId: id, details: `${t.status} → ${status}`, ip });
+  if (t.assigned_to && t.assigned_to !== user.id) {
+    await notify(env, t.assigned_to, "تغيّرت حالة شحنة", `${t.ref_no}: ${status}`, `#/shipments/${id}`);
+  }
+  return ok({ message: "تم تحديث الحالة" });
+}
+
+async function deleteShipment(env, user, id, ip) {
+  if (!can(user, "deleteShipments")) return err("لا تملك صلاحية الحذف", 403);
+  const t = await env.DB.prepare(`SELECT ref_no FROM shipments WHERE id=?`).bind(id).first();
+  if (!t) return err("الشحنة غير موجودة", 404);
+  await env.DB.prepare(`DELETE FROM shipments WHERE id=?`).bind(id).run();
+  await logActivity(env, { userId: user.id, action: "delete", entityType: "shipment", entityId: id, details: t.ref_no, ip });
+  return ok({ message: "تم حذف الشحنة" });
+}
+
+async function shipmentTimeline(env, id) {
+  const { results } = await env.DB.prepare(
+    `SELECT a.*, u.full_name AS user_name FROM activity_log a
+     LEFT JOIN users u ON u.id = a.user_id
+     WHERE a.entity_type='shipment' AND a.entity_id=?
+     ORDER BY a.created_at DESC LIMIT 200`
+  ).bind(id).all();
+  return ok({ timeline: results });
+}
+
+// المحطات الزمنية (تحديث مخصّص لقائمة بيضاء من الأعمدة)
+const MILESTONE_FIELDS = [
+  "docs_submission_date", "do1_date", "do2_date", "do2_no", "trailer_booking_date",
+  "trailer_entry_date", "loading_date", "releasing_date", "arrival_site_date",
+  "offloading_pod_date", "return_token_date", "cc_receipt_date",
+  "finance_settlement_date", "handover_account_date", "accounting_invoice_date",
+];
+
+async function updateMilestones(request, env, user, id, ip) {
+  if (!can(user, "writeShipments") && !can(user, "writeCustoms") && !can(user, "writeTransport")) {
+    return err("لا تملك صلاحية", 403);
+  }
+  const t = await env.DB.prepare(`SELECT ref_no FROM shipments WHERE id=?`).bind(id).first();
+  if (!t) return err("الشحنة غير موجودة", 404);
+  const b = await request.json().catch(() => ({}));
+  const sets = [], args = [];
+  for (const f of MILESTONE_FIELDS) {
+    if (f in b) { sets.push(`${f}=?`); args.push(b[f] === "" ? null : b[f]); }
+  }
+  if (!sets.length) return err("لا حقول للتحديث", 400);
+  args.push(id);
+  await env.DB.prepare(`UPDATE shipments SET ${sets.join(", ")}, updated_at=datetime('now') WHERE id=?`).bind(...args).run();
+  await logActivity(env, { userId: user.id, action: "milestones", entityType: "shipment", entityId: id, details: t.ref_no, ip });
+  return ok({ message: "تم حفظ المحطات الزمنية" });
+}
+
+// الحمولة (الحاويات/CBM/الطرود/الشاحنات) + ودائع الخط الملاحي
+const CARGO_FIELDS = [
+  "cont_20std", "cont_20fr", "cont_20ot", "cont_40std", "cont_40fr", "cont_40ot",
+  "cont_45", "lcl", "roro", "cbm", "total_pkgs", "packaging_type", "total_trailers",
+  "sl_deposit", "sl_deducted", "sl_returned", "deposit_currency", "deposit_receipt_date",
+];
+const CARGO_NUMERIC = new Set(["cont_20std","cont_20fr","cont_20ot","cont_40std","cont_40fr","cont_40ot","cont_45","lcl","roro","cbm","total_pkgs","total_trailers","sl_deposit","sl_deducted","sl_returned"]);
+
+async function updateCargo(request, env, user, id, ip) {
+  if (!can(user, "writeShipments") && !can(user, "writeTransport") && !can(user, "writeFinance")) {
+    return err("لا تملك صلاحية", 403);
+  }
+  const t = await env.DB.prepare(`SELECT ref_no FROM shipments WHERE id=?`).bind(id).first();
+  if (!t) return err("الشحنة غير موجودة", 404);
+  const b = await request.json().catch(() => ({}));
+  const sets = [], args = [];
+  for (const f of CARGO_FIELDS) {
+    if (f in b) {
+      let v = b[f] === "" ? null : b[f];
+      if (v != null && CARGO_NUMERIC.has(f)) v = num(v);
+      sets.push(`${f}=?`); args.push(v);
+    }
+  }
+  if (!sets.length) return err("لا حقول للتحديث", 400);
+  args.push(id);
+  await env.DB.prepare(`UPDATE shipments SET ${sets.join(", ")}, updated_at=datetime('now') WHERE id=?`).bind(...args).run();
+  await logActivity(env, { userId: user.id, action: "cargo", entityType: "shipment", entityId: id, details: t.ref_no, ip });
+  return ok({ message: "تم حفظ بيانات الحمولة" });
+}
+
+// حقول إعادة التصدير
+const REEXPORT_FIELDS = ["pre_alert_date", "docs_to_org_date", "exemption_approval", "transit_through"];
+async function updateReexport(request, env, user, id, ip) {
+  if (!can(user, "writeShipments") && !can(user, "writeCustoms")) return err("لا تملك صلاحية", 403);
+  const t = await env.DB.prepare(`SELECT ref_no FROM shipments WHERE id=?`).bind(id).first();
+  if (!t) return err("الشحنة غير موجودة", 404);
+  const b = await request.json().catch(() => ({}));
+  const sets = [], args = [];
+  for (const f of REEXPORT_FIELDS) { if (f in b) { sets.push(`${f}=?`); args.push(b[f] === "" ? null : b[f]); } }
+  if (!sets.length) return err("لا حقول للتحديث", 400);
+  args.push(id);
+  await env.DB.prepare(`UPDATE shipments SET ${sets.join(", ")}, updated_at=datetime('now') WHERE id=?`).bind(...args).run();
+  await logActivity(env, { userId: user.id, action: "reexport", entityType: "shipment", entityId: id, details: t.ref_no, ip });
+  return ok({ message: "تم حفظ بيانات إعادة التصدير" });
+}
+
+// =====================================================================
+//  عمليات الكمارك (CD/LB)
+// =====================================================================
+async function listCustomsOps(env, user) {
+  const { results } = await env.DB.prepare(
+    `SELECT co.*, cl.name AS client_name FROM customs_operations co
+     LEFT JOIN clients cl ON cl.id=co.client_id ORDER BY co.id DESC LIMIT 500`
+  ).all();
+  return ok({ operations: results });
+}
+async function getCustomsOp(env, id) {
+  const op = await env.DB.prepare(
+    `SELECT co.*, cl.name AS client_name FROM customs_operations co
+     LEFT JOIN clients cl ON cl.id=co.client_id WHERE co.id=?`
+  ).bind(id).first();
+  if (!op) return err("العملية غير موجودة", 404);
+  return ok({ operation: op });
+}
+const CUSTOPS_FIELDS = ["abr_ref","job_type","client_id","pic","operation_org","oil_company","contract_no","qty_cdlb","cd_no","cd_last_expire","cd_new_expire","lb_no","lb_last_expire","lb_new_expire","process_start_date","process_end_date","handover_account_date","receive_account_date","invoice_client_date","status","notes"];
+const CUSTOPS_BOOL = ["handover_to_client","pod_signed"];
+async function createCustomsOp(request, env, user, ip) {
+  if (!can(user, "writeCustomsOps")) return err("لا تملك صلاحية", 403);
+  const b = await request.json().catch(() => ({}));
+  const cols = [], ph = [], args = [];
+  for (const f of CUSTOPS_FIELDS) { cols.push(f); ph.push("?"); let v = b[f] === "" ? null : (b[f] ?? null); if (f === "client_id" && v != null) v = num(v); args.push(v); }
+  for (const f of CUSTOPS_BOOL) { cols.push(f); ph.push("?"); args.push(truthy(b[f]) ? 1 : 0); }
+  cols.push("created_by"); ph.push("?"); args.push(user.id);
+  const res = await env.DB.prepare(`INSERT INTO customs_operations (${cols.join(",")}) VALUES (${ph.join(",")})`).bind(...args).run();
+  await logActivity(env, { userId: user.id, action: "create", entityType: "customs_op", entityId: res.meta.last_row_id, details: b.abr_ref || "", ip });
+  return ok({ id: res.meta.last_row_id, message: "تم إنشاء عملية الكمارك" });
+}
+async function updateCustomsOp(request, env, user, id, ip) {
+  if (!can(user, "writeCustomsOps")) return err("لا تملك صلاحية", 403);
+  const t = await env.DB.prepare(`SELECT id FROM customs_operations WHERE id=?`).bind(id).first();
+  if (!t) return err("العملية غير موجودة", 404);
+  const b = await request.json().catch(() => ({}));
+  const sets = [], args = [];
+  for (const f of CUSTOPS_FIELDS) { if (f in b) { let v = b[f] === "" ? null : b[f]; if (f === "client_id" && v != null) v = num(v); sets.push(`${f}=?`); args.push(v); } }
+  for (const f of CUSTOPS_BOOL) { if (f in b) { sets.push(`${f}=?`); args.push(truthy(b[f]) ? 1 : 0); } }
+  if (!sets.length) return err("لا حقول للتحديث", 400);
+  args.push(id);
+  await env.DB.prepare(`UPDATE customs_operations SET ${sets.join(",")}, updated_at=datetime('now') WHERE id=?`).bind(...args).run();
+  await logActivity(env, { userId: user.id, action: "update", entityType: "customs_op", entityId: id, ip });
+  return ok({ message: "تم تحديث العملية" });
+}
+async function deleteCustomsOp(env, user, id, ip) {
+  if (!can(user, "writeCustomsOps")) return err("لا تملك صلاحية", 403);
+  await env.DB.prepare(`DELETE FROM customs_operations WHERE id=?`).bind(id).run();
+  await logActivity(env, { userId: user.id, action: "delete", entityType: "customs_op", entityId: id, ip });
+  return ok({ message: "تم حذف العملية" });
+}
+
+// تحديثات الحالة (السرد المؤرّخ)
+async function listStatusUpdates(env, id) {
+  const { results } = await env.DB.prepare(
+    `SELECT su.*, u.full_name AS user_name FROM status_updates su
+     LEFT JOIN users u ON u.id=su.created_by WHERE su.shipment_id=? ORDER BY su.id DESC LIMIT 100`
+  ).bind(id).all();
+  return ok({ updates: results });
+}
+
+async function addStatusUpdate(request, env, user, id, ip) {
+  if (!can(user, "comment")) return err("لا تملك صلاحية", 403);
+  const ship = await env.DB.prepare(`SELECT ref_no, assigned_to FROM shipments WHERE id=?`).bind(id).first();
+  if (!ship) return err("الشحنة غير موجودة", 404);
+  const b = await request.json().catch(() => ({}));
+  const note = (b.note || "").trim();
+  if (!note) return err("نص التحديث مطلوب", 400);
+  const upDate = b.update_date || null;
+  await env.DB.prepare(
+    `INSERT INTO status_updates (shipment_id, note, update_date, created_by) VALUES (?,?,?,?)`
+  ).bind(id, note, upDate, user.id).run();
+  // حدّث آخر تحديث على الشحنة (يظهر في القوائم واللوحة)
+  await env.DB.prepare(
+    `UPDATE shipments SET latest_update=?, latest_update_at=datetime('now'), updated_at=datetime('now') WHERE id=?`
+  ).bind(note.slice(0, 300), id).run();
+  if (ship.assigned_to && ship.assigned_to !== user.id) {
+    await notify(env, ship.assigned_to, "تحديث على شحنة", `${ship.ref_no}: ${note.slice(0, 80)}`, `#/shipments/${id}`);
+  }
+  await logActivity(env, { userId: user.id, action: "update_note", entityType: "shipment", entityId: id, ip });
+  return ok({ message: "تم إضافة التحديث" });
+}
+
+// التنبيهات الذكية (لوجستية)
+async function alerts(env, user) {
+  // 1) خطر الأرضيات (Demurrage): شحنات في الميناء/التخليص تجاوزت أو تقترب من أيام السماح
+  const demRows = (await env.DB.prepare(
+    `SELECT s.id, s.ref_no, s.title, s.status, cl.name AS client_name,
+            c.port_arrival_date, c.free_days
+     FROM shipments s
+     LEFT JOIN clients cl ON cl.id=s.client_id
+     LEFT JOIN customs_declarations c ON c.id=(SELECT id FROM customs_declarations WHERE shipment_id=s.id ORDER BY id DESC LIMIT 1)
+     WHERE s.status IN ('at_port','customs_clearance') AND c.port_arrival_date IS NOT NULL`
+  ).all()).results;
+  const demurrage = [];
+  for (const r of demRows) {
+    const arr = new Date(String(r.port_arrival_date).replace(" ", "T"));
+    if (isNaN(arr)) continue;
+    const days = Math.floor((Date.now() - arr) / 86400000);
+    const remaining = (r.free_days || 0) - days;
+    if (remaining <= 3) {
+      demurrage.push({ ...r, days_at_port: days, remaining_free: remaining,
+        over: remaining < 0 ? Math.abs(remaining) : 0 });
+    }
+  }
+  demurrage.sort((a, b) => a.remaining_free - b.remaining_free);
+
+  // 2) متأخرة: تجاوزت ETA ولم تُسلّم
+  const overdue = (await env.DB.prepare(
+    `SELECT s.id, s.ref_no, s.title, s.status, s.eta, cl.name AS client_name
+     FROM shipments s LEFT JOIN clients cl ON cl.id=s.client_id
+     WHERE s.eta IS NOT NULL AND s.eta < date('now')
+       AND s.status NOT IN ('delivered','closed','cancelled')
+     ORDER BY s.eta ASC LIMIT 50`
+  ).all()).results;
+
+  // 3) راكدة: لم تُحدّث منذ 7 أيام وغير منتهية
+  const stale = (await env.DB.prepare(
+    `SELECT s.id, s.ref_no, s.title, s.status, s.updated_at, cl.name AS client_name
+     FROM shipments s LEFT JOIN clients cl ON cl.id=s.client_id
+     WHERE s.updated_at < datetime('now','-7 days')
+       AND s.status NOT IN ('delivered','closed','cancelled')
+     ORDER BY s.updated_at ASC LIMIT 50`
+  ).all()).results;
+
+  // 4) انتهاء CD/LB: مستندات كمركية أو كفالات تنتهي خلال 30 يوماً أو منتهية
+  const cdlbRows = (await env.DB.prepare(
+    `SELECT co.id, co.abr_ref, co.job_type, co.cd_no, co.cd_new_expire, co.lb_no, co.lb_new_expire,
+            cl.name AS client_name
+     FROM customs_operations co LEFT JOIN clients cl ON cl.id=co.client_id
+     WHERE co.status != 'done' AND (co.cd_new_expire IS NOT NULL OR co.lb_new_expire IS NOT NULL)`
+  ).all()).results;
+  const cdlb = [];
+  for (const r of cdlbRows) {
+    const items = [];
+    for (const [kind, no, exp] of [["CD", r.cd_no, r.cd_new_expire], ["LB", r.lb_no, r.lb_new_expire]]) {
+      if (!exp) continue;
+      const d = new Date(String(exp).replace(" ", "T"));
+      if (isNaN(d)) continue;
+      const daysLeft = Math.ceil((d - Date.now()) / 86400000);
+      if (daysLeft <= 30) items.push({ kind, no, expire: exp, days_left: daysLeft });
+    }
+    if (items.length) cdlb.push({ id: r.id, abr_ref: r.abr_ref, client_name: r.client_name, items });
+  }
+  cdlb.sort((a, b) => Math.min(...a.items.map((i) => i.days_left)) - Math.min(...b.items.map((i) => i.days_left)));
+
+  return ok({ demurrage, overdue, stale, cdlb,
+    counts: { demurrage: demurrage.length, overdue: overdue.length, stale: stale.length, cdlb: cdlb.length } });
+}
+
+// =====================================================================
+//  المستندات (R2)
+// =====================================================================
+async function listDocuments(env, shipmentId) {
+  const { results } = await env.DB.prepare(
+    `SELECT d.*, u.full_name AS uploaded_name FROM shipment_documents d
+     LEFT JOIN users u ON u.id=d.uploaded_by WHERE d.shipment_id=? ORDER BY d.uploaded_at DESC`
+  ).bind(shipmentId).all();
+  return ok({ documents: results });
+}
+
+async function uploadDocument(request, env, user, shipmentId, ip) {
+  if (!can(user, "writeDocuments")) return err("لا تملك صلاحية رفع المستندات", 403);
+  if (!env.DOCS) return err("خدمة تخزين المستندات (R2) غير مُفعّلة بعد", 503);
+  const ship = await env.DB.prepare(`SELECT id, ref_no FROM shipments WHERE id=?`).bind(shipmentId).first();
+  if (!ship) return err("الشحنة غير موجودة", 404);
+
+  const form = await request.formData().catch(() => null);
+  if (!form) return err("صيغة الرفع غير صحيحة (FormData مطلوب)", 400);
+  const file = form.get("file");
+  if (!file || typeof file === "string") return err("الملف مطلوب", 400);
+  const docType = form.get("doc_type") || "other";
+  const title = form.get("title") || file.name;
+
+  const MAX = 20 * 1024 * 1024; // 20MB
+  if (file.size > MAX) return err("حجم الملف يتجاوز 20 ميغابايت", 413);
+
+  const safeName = (file.name || "file").replace(/[^\w.\-]+/g, "_");
+  const key = `shipments/${shipmentId}/${Date.now()}_${safeName}`;
+  await env.DOCS.put(key, file.stream(), {
+    httpMetadata: { contentType: file.type || "application/octet-stream" },
+  });
+  const res = await env.DB.prepare(
+    `INSERT INTO shipment_documents (shipment_id, doc_type, title, file_name, r2_key, size_bytes, mime_type, uploaded_by)
+     VALUES (?,?,?,?,?,?,?,?)`
+  ).bind(shipmentId, docType, title, file.name || safeName, key, file.size, file.type || null, user.id).run();
+  await logActivity(env, { userId: user.id, action: "upload", entityType: "document", entityId: res.meta.last_row_id, details: `${ship.ref_no}: ${title}`, ip });
+  return ok({ id: res.meta.last_row_id, message: "تم رفع المستند" });
+}
+
+async function addDocumentLink(request, env, user, shipmentId, ip) {
+  if (!can(user, "writeDocuments")) return err("لا تملك صلاحية إضافة المستندات", 403);
+  const ship = await env.DB.prepare(`SELECT id, ref_no FROM shipments WHERE id=?`).bind(shipmentId).first();
+  if (!ship) return err("الشحنة غير موجودة", 404);
+  const b = await request.json().catch(() => ({}));
+  const url = (b.url || "").trim();
+  if (!/^https?:\/\/.+/i.test(url)) return err("رابط غير صحيح (يجب أن يبدأ بـ http/https)", 400);
+  const title = (b.title || "").trim() || url;
+  const docType = b.doc_type || "other";
+  const res = await env.DB.prepare(
+    `INSERT INTO shipment_documents (shipment_id, kind, doc_type, title, file_name, r2_key, doc_url, uploaded_by)
+     VALUES (?, 'link', ?, ?, ?, '', ?, ?)`
+  ).bind(shipmentId, docType, title, title, url, user.id).run();
+  await logActivity(env, { userId: user.id, action: "doc_link", entityType: "document", entityId: res.meta.last_row_id, details: `${ship.ref_no}: ${title}`, ip });
+  return ok({ id: res.meta.last_row_id, message: "تمت إضافة رابط المستند" });
+}
+
+async function downloadDocument(env, docId) {
+  const doc = await env.DB.prepare(`SELECT * FROM shipment_documents WHERE id=?`).bind(docId).first();
+  if (!doc) return err("المستند غير موجود", 404);
+  if (doc.kind === "link") return Response.redirect(doc.doc_url, 302);
+  if (!env.DOCS) return err("خدمة تخزين المستندات (R2) غير مُفعّلة بعد", 503);
+  const obj = await env.DOCS.get(doc.r2_key);
+  if (!obj) return err("الملف غير موجود في التخزين", 404);
+  const headers = new Headers();
+  headers.set("Content-Type", doc.mime_type || "application/octet-stream");
+  headers.set("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(doc.file_name)}`);
+  return new Response(obj.body, { status: 200, headers });
+}
+
+async function deleteDocument(env, user, docId, ip) {
+  if (!can(user, "writeDocuments")) return err("لا تملك صلاحية", 403);
+  const doc = await env.DB.prepare(`SELECT * FROM shipment_documents WHERE id=?`).bind(docId).first();
+  if (!doc) return err("المستند غير موجود", 404);
+  if (doc.kind === "file" && doc.r2_key && env.DOCS) {
+    await env.DOCS.delete(doc.r2_key).catch(() => {});
+  }
+  await env.DB.prepare(`DELETE FROM shipment_documents WHERE id=?`).bind(docId).run();
+  await logActivity(env, { userId: user.id, action: "delete", entityType: "document", entityId: docId, ip });
+  return ok({ message: "تم حذف المستند" });
+}
+
+// =====================================================================
+//  التعليقات
+// =====================================================================
+async function listComments(env, shipmentId) {
+  const { results } = await env.DB.prepare(
+    `SELECT c.*, u.full_name AS user_name, u.role AS user_role FROM comments c
+     LEFT JOIN users u ON u.id=c.user_id WHERE c.shipment_id=? ORDER BY c.created_at ASC`
+  ).bind(shipmentId).all();
+  return ok({ comments: results });
+}
+
+async function addComment(request, env, user, shipmentId, ip) {
+  if (!can(user, "comment")) return err("لا تملك صلاحية التعليق", 403);
+  const { body } = await request.json().catch(() => ({}));
+  if (!body || !body.trim()) return err("نص التعليق مطلوب", 400);
+  const ship = await env.DB.prepare(`SELECT id, ref_no, assigned_to FROM shipments WHERE id=?`).bind(shipmentId).first();
+  if (!ship) return err("الشحنة غير موجودة", 404);
+  const res = await env.DB.prepare(
+    `INSERT INTO comments (shipment_id, user_id, body) VALUES (?,?,?)`
+  ).bind(shipmentId, user.id, body.trim()).run();
+  if (ship.assigned_to && ship.assigned_to !== user.id) {
+    await notify(env, ship.assigned_to, "تعليق جديد على شحنة", `${ship.ref_no}`, `#/shipments/${shipmentId}`);
+  }
+  await logActivity(env, { userId: user.id, action: "comment", entityType: "shipment", entityId: shipmentId, ip });
+  return ok({ id: res.meta.last_row_id, message: "تمت إضافة التعليق" });
+}
+
+// =====================================================================
+//  التخليص الكمركي
+// =====================================================================
+function calcDemurrage(portArrival, freeDays) {
+  if (!portArrival) return { days_at_port: 0, demurrage_days: 0 };
+  const arr = new Date(portArrival.replace(" ", "T"));
+  if (isNaN(arr)) return { days_at_port: 0, demurrage_days: 0 };
+  const days = Math.floor((Date.now() - arr) / 86400000);
+  const dem = Math.max(0, days - (freeDays || 0));
+  return { days_at_port: Math.max(0, days), demurrage_days: dem };
+}
+
+async function saveCustoms(request, env, user, shipmentId, ip) {
+  if (!can(user, "writeCustoms")) return err("لا تملك صلاحية التخليص الكمركي", 403);
+  const ship = await env.DB.prepare(`SELECT id, ref_no, status, assigned_to FROM shipments WHERE id=?`).bind(shipmentId).first();
+  if (!ship) return err("الشحنة غير موجودة", 404);
+  const b = await request.json().catch(() => ({}));
+
+  const duty = num(b.duty_amount), tax = num(b.tax_amount), other = num(b.other_fees);
+  const total = b.total_fees != null && b.total_fees !== "" ? num(b.total_fees) : (duty + tax + other);
+
+  const existing = await env.DB.prepare(`SELECT id FROM customs_declarations WHERE shipment_id=? ORDER BY id DESC LIMIT 1`).bind(shipmentId).first();
+  if (existing) {
+    await env.DB.prepare(
+      `UPDATE customs_declarations SET declaration_no=?, customs_office=?, hs_code=?, duty_rate=?,
+         duty_amount=?, tax_amount=?, other_fees=?, total_fees=?, currency=?, clearance_status=?,
+         port_arrival_date=?, free_days=?, cleared_date=?, broker_name=?, notes=?, updated_at=datetime('now')
+       WHERE id=?`
+    ).bind(
+      b.declaration_no || null, b.customs_office || null, b.hs_code || null, num(b.duty_rate),
+      duty, tax, other, total, b.currency || "USD", b.clearance_status || "pending",
+      b.port_arrival_date || null, parseInt(b.free_days || 0, 10), b.cleared_date || null,
+      b.broker_name || null, b.notes || null, existing.id
+    ).run();
+  } else {
+    await env.DB.prepare(
+      `INSERT INTO customs_declarations
+        (shipment_id, declaration_no, customs_office, hs_code, duty_rate, duty_amount, tax_amount,
+         other_fees, total_fees, currency, clearance_status, port_arrival_date, free_days, cleared_date,
+         broker_name, notes, created_by)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    ).bind(
+      shipmentId, b.declaration_no || null, b.customs_office || null, b.hs_code || null, num(b.duty_rate),
+      duty, tax, other, total, b.currency || "USD", b.clearance_status || "pending",
+      b.port_arrival_date || null, parseInt(b.free_days || 0, 10), b.cleared_date || null,
+      b.broker_name || null, b.notes || null, user.id
+    ).run();
+  }
+
+  // تحديث حالة الشحنة تلقائياً حسب التخليص
+  if (b.clearance_status === "cleared" && ship.status === "customs_clearance") {
+    await env.DB.prepare(`UPDATE shipments SET status='in_transport', updated_at=datetime('now') WHERE id=?`).bind(shipmentId).run();
+  } else if (b.clearance_status && b.clearance_status !== "pending" && ["opened","at_port"].includes(ship.status)) {
+    await env.DB.prepare(`UPDATE shipments SET status='customs_clearance', updated_at=datetime('now') WHERE id=?`).bind(shipmentId).run();
+  }
+
+  await logActivity(env, { userId: user.id, action: "customs", entityType: "shipment", entityId: shipmentId, details: `${ship.ref_no}: ${b.clearance_status || ""}`, ip });
+  if (ship.assigned_to && ship.assigned_to !== user.id) {
+    await notify(env, ship.assigned_to, "تحديث كمركي", `${ship.ref_no}: ${b.clearance_status || "تحديث"}`, `#/shipments/${shipmentId}`);
+  }
+  return ok({ message: "تم حفظ البيان الكمركي" });
+}
+
+async function customsQueue(env, user) {
+  const { results } = await env.DB.prepare(
+    `SELECT s.id, s.ref_no, s.title, s.status, s.priority, s.destination, sup.name AS supplier_name,
+            c.declaration_no, c.clearance_status, c.total_fees, c.currency, c.port_arrival_date, c.free_days, c.customs_office
+     FROM shipments s
+     LEFT JOIN suppliers sup ON sup.id = s.supplier_id
+     LEFT JOIN customs_declarations c ON c.id = (SELECT id FROM customs_declarations WHERE shipment_id=s.id ORDER BY id DESC LIMIT 1)
+     WHERE s.status IN ('at_port','customs_clearance')
+     ORDER BY (s.priority='urgent') DESC, s.created_at ASC`
+  ).all();
+  const rows = results.map((r) => ({ ...r, ...calcDemurrage(r.port_arrival_date, r.free_days) }));
+  return ok({ queue: rows });
+}
+
+// =====================================================================
+//  النقل
+// =====================================================================
+async function listTransport(env, shipmentId) {
+  const { results } = await env.DB.prepare(
+    `SELECT t.*, u.full_name AS created_name FROM transport_orders t
+     LEFT JOIN users u ON u.id=t.created_by WHERE t.shipment_id=? ORDER BY t.id DESC`
+  ).bind(shipmentId).all();
+  return ok({ transport: results });
+}
+
+async function createTransport(request, env, user, shipmentId, ip) {
+  if (!can(user, "writeTransport")) return err("لا تملك صلاحية النقل", 403);
+  const ship = await env.DB.prepare(`SELECT id, ref_no, status, assigned_to FROM shipments WHERE id=?`).bind(shipmentId).first();
+  if (!ship) return err("الشحنة غير موجودة", 404);
+  const b = await request.json().catch(() => ({}));
+  const res = await env.DB.prepare(
+    `INSERT INTO transport_orders
+      (shipment_id, order_no, carrier, truck_no, driver_name, driver_phone, pickup_location,
+       delivery_location, dispatch_date, delivery_date, status, cost, currency,
+       booked_trailers, container_return_date, eir_received, in_storage, notes, created_by)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).bind(
+    shipmentId, b.order_no || null, b.carrier || null, b.truck_no || null, b.driver_name || null,
+    b.driver_phone || null, b.pickup_location || null, b.delivery_location || null,
+    b.dispatch_date || null, b.delivery_date || null, b.status || "assigned", num(b.cost),
+    b.currency || "USD", b.booked_trailers != null ? num(b.booked_trailers) : null,
+    b.container_return_date || null, truthy(b.eir_received) ? 1 : 0, truthy(b.in_storage) ? 1 : 0,
+    b.notes || null, user.id
+  ).run();
+  // مزامنة حالة الشحنة
+  if (["dispatched", "in_transit"].includes(b.status) && ["customs_clearance","at_port"].includes(ship.status)) {
+    await env.DB.prepare(`UPDATE shipments SET status='in_transport', updated_at=datetime('now') WHERE id=?`).bind(shipmentId).run();
+  }
+  if (b.status === "delivered") {
+    await env.DB.prepare(`UPDATE shipments SET status='delivered', delivered_date=datetime('now'), updated_at=datetime('now') WHERE id=?`).bind(shipmentId).run();
+  }
+  await logActivity(env, { userId: user.id, action: "transport", entityType: "shipment", entityId: shipmentId, details: `${ship.ref_no}: ${b.truck_no || ""}`, ip });
+  if (ship.assigned_to && ship.assigned_to !== user.id) {
+    await notify(env, ship.assigned_to, "أمر نقل جديد", `${ship.ref_no}`, `#/shipments/${shipmentId}`);
+  }
+  return ok({ id: res.meta.last_row_id, message: "تم إنشاء أمر النقل" });
+}
+
+async function updateTransport(request, env, user, tid, ip) {
+  if (!can(user, "writeTransport")) return err("لا تملك صلاحية", 403);
+  const t = await env.DB.prepare(`SELECT * FROM transport_orders WHERE id=?`).bind(tid).first();
+  if (!t) return err("أمر النقل غير موجود", 404);
+  const b = await request.json().catch(() => ({}));
+  await env.DB.prepare(
+    `UPDATE transport_orders SET order_no=?, carrier=?, truck_no=?, driver_name=?, driver_phone=?,
+       pickup_location=?, delivery_location=?, dispatch_date=?, delivery_date=?, status=?, cost=?, currency=?,
+       booked_trailers=?, container_return_date=?, eir_received=?, in_storage=?, notes=?, updated_at=datetime('now')
+     WHERE id=?`
+  ).bind(
+    b.order_no ?? t.order_no, b.carrier ?? t.carrier, b.truck_no ?? t.truck_no, b.driver_name ?? t.driver_name,
+    b.driver_phone ?? t.driver_phone, b.pickup_location ?? t.pickup_location, b.delivery_location ?? t.delivery_location,
+    b.dispatch_date ?? t.dispatch_date, b.delivery_date ?? t.delivery_date, b.status ?? t.status,
+    b.cost != null ? num(b.cost) : t.cost, b.currency ?? t.currency,
+    b.booked_trailers != null ? num(b.booked_trailers) : t.booked_trailers,
+    b.container_return_date ?? t.container_return_date,
+    b.eir_received != null ? (truthy(b.eir_received) ? 1 : 0) : t.eir_received,
+    b.in_storage != null ? (truthy(b.in_storage) ? 1 : 0) : t.in_storage,
+    b.notes ?? t.notes, tid
+  ).run();
+  if (b.status === "delivered") {
+    await env.DB.prepare(`UPDATE shipments SET status='delivered', delivered_date=datetime('now'), updated_at=datetime('now') WHERE id=? AND status NOT IN ('closed','cancelled')`).bind(t.shipment_id).run();
+  } else if (["dispatched","in_transit"].includes(b.status)) {
+    await env.DB.prepare(`UPDATE shipments SET status='in_transport', updated_at=datetime('now') WHERE id=? AND status IN ('customs_clearance','at_port')`).bind(t.shipment_id).run();
+  }
+  await logActivity(env, { userId: user.id, action: "transport_update", entityType: "shipment", entityId: t.shipment_id, ip });
+  return ok({ message: "تم تحديث أمر النقل" });
+}
+
+async function deleteTransport(env, user, tid, ip) {
+  if (!can(user, "writeTransport")) return err("لا تملك صلاحية", 403);
+  const t = await env.DB.prepare(`SELECT shipment_id FROM transport_orders WHERE id=?`).bind(tid).first();
+  if (!t) return err("غير موجود", 404);
+  await env.DB.prepare(`DELETE FROM transport_orders WHERE id=?`).bind(tid).run();
+  await logActivity(env, { userId: user.id, action: "transport_delete", entityType: "shipment", entityId: t.shipment_id, ip });
+  return ok({ message: "تم الحذف" });
+}
+
+async function transportQueue(env, user) {
+  const { results } = await env.DB.prepare(
+    `SELECT s.id, s.ref_no, s.title, s.status, s.priority, s.destination, sup.name AS supplier_name,
+            t.truck_no, t.driver_name, t.driver_phone, t.carrier, t.status AS transport_status, t.dispatch_date, t.delivery_location
+     FROM shipments s
+     LEFT JOIN suppliers sup ON sup.id = s.supplier_id
+     LEFT JOIN transport_orders t ON t.id = (SELECT id FROM transport_orders WHERE shipment_id=s.id ORDER BY id DESC LIMIT 1)
+     WHERE s.status IN ('customs_clearance','in_transport')
+     ORDER BY (s.priority='urgent') DESC, s.created_at ASC`
+  ).all();
+  return ok({ queue: results });
+}
+
+// =====================================================================
+//  الحسابات (المالية)
+// =====================================================================
+async function listFinance(env, shipmentId) {
+  const { results } = await env.DB.prepare(
+    `SELECT f.*, u.full_name AS created_name FROM finance_records f
+     LEFT JOIN users u ON u.id=f.created_by WHERE f.shipment_id=? ORDER BY f.id DESC`
+  ).bind(shipmentId).all();
+  return ok({ finance: results });
+}
+
+async function createFinance(request, env, user, shipmentId, ip) {
+  if (!can(user, "writeFinance")) return err("لا تملك صلاحية الحسابات", 403);
+  const ship = await env.DB.prepare(`SELECT id, ref_no, assigned_to FROM shipments WHERE id=?`).bind(shipmentId).first();
+  if (!ship) return err("الشحنة غير موجودة", 404);
+  const b = await request.json().catch(() => ({}));
+  if (!["cost", "invoice", "payment"].includes(b.type)) return err("نوع السجل غير صحيح", 400);
+  const res = await env.DB.prepare(
+    `INSERT INTO finance_records (shipment_id, type, category, description, amount, currency, record_date, due_date, status, reference_no, created_by)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?)`
+  ).bind(
+    shipmentId, b.type, b.category || null, b.description || null, num(b.amount), b.currency || "USD",
+    b.record_date || null, b.due_date || null, b.status || "open", b.reference_no || null, user.id
+  ).run();
+  await logActivity(env, { userId: user.id, action: "finance", entityType: "shipment", entityId: shipmentId, details: `${ship.ref_no}: ${b.type} ${num(b.amount)}`, ip });
+  return ok({ id: res.meta.last_row_id, message: "تم حفظ السجل المالي" });
+}
+
+async function updateFinance(request, env, user, fid, ip) {
+  if (!can(user, "writeFinance")) return err("لا تملك صلاحية", 403);
+  const f = await env.DB.prepare(`SELECT * FROM finance_records WHERE id=?`).bind(fid).first();
+  if (!f) return err("السجل غير موجود", 404);
+  const b = await request.json().catch(() => ({}));
+  await env.DB.prepare(
+    `UPDATE finance_records SET type=?, category=?, description=?, amount=?, currency=?, record_date=?, due_date=?, status=?, reference_no=?, updated_at=datetime('now') WHERE id=?`
+  ).bind(
+    b.type ?? f.type, b.category ?? f.category, b.description ?? f.description,
+    b.amount != null ? num(b.amount) : f.amount, b.currency ?? f.currency,
+    b.record_date ?? f.record_date, b.due_date ?? f.due_date, b.status ?? f.status, b.reference_no ?? f.reference_no, fid
+  ).run();
+  await logActivity(env, { userId: user.id, action: "finance_update", entityType: "shipment", entityId: f.shipment_id, ip });
+  return ok({ message: "تم تحديث السجل" });
+}
+
+async function deleteFinance(env, user, fid, ip) {
+  if (!can(user, "writeFinance")) return err("لا تملك صلاحية", 403);
+  const f = await env.DB.prepare(`SELECT shipment_id FROM finance_records WHERE id=?`).bind(fid).first();
+  if (!f) return err("غير موجود", 404);
+  await env.DB.prepare(`DELETE FROM finance_records WHERE id=?`).bind(fid).run();
+  await logActivity(env, { userId: user.id, action: "finance_delete", entityType: "shipment", entityId: f.shipment_id, ip });
+  return ok({ message: "تم الحذف" });
+}
+
+async function financeOverview(request, env, user, url) {
+  if (!can(user, "writeFinance")) return err("لا تملك صلاحية", 403);
+  const totals = await env.DB.prepare(
+    `SELECT
+       COALESCE(SUM(CASE WHEN type='cost' THEN amount END),0) AS total_cost,
+       COALESCE(SUM(CASE WHEN type='invoice' THEN amount END),0) AS total_invoiced,
+       COALESCE(SUM(CASE WHEN type='payment' THEN amount END),0) AS total_paid,
+       COALESCE(SUM(CASE WHEN type='cost' AND status IN ('open','partial','overdue') THEN amount END),0) AS outstanding
+     FROM finance_records`
+  ).first();
+  const byCategory = (await env.DB.prepare(
+    `SELECT category, type, COALESCE(SUM(amount),0) AS total, COUNT(*) AS c
+     FROM finance_records GROUP BY category, type ORDER BY total DESC LIMIT 50`
+  ).all()).results;
+  const recent = (await env.DB.prepare(
+    `SELECT f.*, s.ref_no FROM finance_records f LEFT JOIN shipments s ON s.id=f.shipment_id
+     ORDER BY f.id DESC LIMIT 30`
+  ).all()).results;
+  const byShipment = (await env.DB.prepare(
+    `SELECT s.id, s.ref_no, s.title, s.currency,
+       COALESCE(SUM(CASE WHEN f.type='cost' THEN f.amount END),0) AS cost,
+       COALESCE(SUM(CASE WHEN f.type='payment' THEN f.amount END),0) AS paid
+     FROM shipments s JOIN finance_records f ON f.shipment_id=s.id
+     GROUP BY s.id ORDER BY cost DESC LIMIT 20`
+  ).all()).results;
+  return ok({ totals, by_category: byCategory, recent, by_shipment: byShipment });
+}
+
+// =====================================================================
+//  الناقلون
+// =====================================================================
+async function listCarriers(env) {
+  const { results } = await env.DB.prepare(`SELECT * FROM carriers ORDER BY kind DESC, name COLLATE NOCASE`).all();
+  return ok({ carriers: results });
+}
+async function createCarrier(request, env, user, ip) {
+  if (!can(user, "writeCarriers")) return err("لا تملك صلاحية", 403);
+  const b = await request.json().catch(() => ({}));
+  if (!b.name) return err("اسم الناقل مطلوب", 400);
+  const res = await env.DB.prepare(
+    `INSERT INTO carriers (name, kind, phone, notes, created_by) VALUES (?,?,?,?,?)`
+  ).bind(b.name, b.kind || "subcontractor", b.phone || null, b.notes || null, user.id).run();
+  await logActivity(env, { userId: user.id, action: "create", entityType: "carrier", entityId: res.meta.last_row_id, details: b.name, ip });
+  return ok({ id: res.meta.last_row_id, message: "تم إضافة الناقل" });
+}
+async function updateCarrier(request, env, user, id, ip) {
+  if (!can(user, "writeCarriers")) return err("لا تملك صلاحية", 403);
+  const b = await request.json().catch(() => ({}));
+  const t = await env.DB.prepare(`SELECT * FROM carriers WHERE id=?`).bind(id).first();
+  if (!t) return err("الناقل غير موجود", 404);
+  await env.DB.prepare(
+    `UPDATE carriers SET name=?, kind=?, phone=?, notes=?, active=?, updated_at=datetime('now') WHERE id=?`
+  ).bind(b.name ?? t.name, b.kind ?? t.kind, b.phone ?? t.phone, b.notes ?? t.notes,
+    b.active != null ? (b.active ? 1 : 0) : t.active, id).run();
+  await logActivity(env, { userId: user.id, action: "update", entityType: "carrier", entityId: id, ip });
+  return ok({ message: "تم تحديث الناقل" });
+}
+async function deleteCarrier(env, user, id, ip) {
+  if (!can(user, "writeCarriers")) return err("لا تملك صلاحية", 403);
+  await env.DB.prepare(`UPDATE carriers SET active=0, updated_at=datetime('now') WHERE id=?`).bind(id).run();
+  await logActivity(env, { userId: user.id, action: "delete", entityType: "carrier", entityId: id, ip });
+  return ok({ message: "تم حذف الناقل" });
+}
+
+// =====================================================================
+//  الغرامات (غرامات الخطوط الملاحية)
+// =====================================================================
+async function listShipmentPenalties(env, shipmentId) {
+  const { results } = await env.DB.prepare(
+    `SELECT * FROM penalties WHERE shipment_id=? ORDER BY id DESC`
+  ).bind(shipmentId).all();
+  return ok({ penalties: results });
+}
+async function listPenalties(env, user) {
+  if (!can(user, "writePenalties")) return err("لا تملك صلاحية", 403);
+  const { results } = await env.DB.prepare(
+    `SELECT p.*, s.ref_no AS shipment_ref_no FROM penalties p
+     LEFT JOIN shipments s ON s.id=p.shipment_id ORDER BY p.id DESC LIMIT 500`
+  ).all();
+  const byCurrency = {};
+  for (const r of results) { const c = r.currency || "IQD"; byCurrency[c] = (byCurrency[c] || 0) + (r.penalty_amount || 0); }
+  return ok({ penalties: results, total: results.length, by_currency: byCurrency });
+}
+async function createPenalty(request, env, user, ip) {
+  if (!can(user, "writePenalties")) return err("لا تملك صلاحية", 403);
+  const b = await request.json().catch(() => ({}));
+  let shipmentId = b.shipment_id || null;
+  // ربط تلقائي بالشحنة عبر رقم المرجع إن لم يُحدّد
+  if (!shipmentId && b.shipment_ref) {
+    const s = await env.DB.prepare(`SELECT id FROM shipments WHERE ref_no=?`).bind(b.shipment_ref).first();
+    if (s) shipmentId = s.id;
+  }
+  const res = await env.DB.prepare(
+    `INSERT INTO penalties (shipment_id, shipment_ref, client, shipping_line, agent, type_of_entry, penalty_amount, currency, do_receipt, submission_date, pic, notes, created_by)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).bind(shipmentId, b.shipment_ref || null, b.client || null, b.shipping_line || null, b.agent || null,
+    b.type_of_entry || null, num(b.penalty_amount), b.currency || "IQD", truthy(b.do_receipt) ? 1 : 0,
+    b.submission_date || null, b.pic || null, b.notes || null, user.id).run();
+  await logActivity(env, { userId: user.id, action: "create", entityType: "penalty", entityId: res.meta.last_row_id, details: b.shipment_ref || "", ip });
+  return ok({ id: res.meta.last_row_id, message: "تم تسجيل الغرامة" });
+}
+async function updatePenalty(request, env, user, id, ip) {
+  if (!can(user, "writePenalties")) return err("لا تملك صلاحية", 403);
+  const t = await env.DB.prepare(`SELECT * FROM penalties WHERE id=?`).bind(id).first();
+  if (!t) return err("الغرامة غير موجودة", 404);
+  const b = await request.json().catch(() => ({}));
+  await env.DB.prepare(
+    `UPDATE penalties SET shipment_ref=?, client=?, shipping_line=?, agent=?, type_of_entry=?, penalty_amount=?, currency=?, do_receipt=?, submission_date=?, pic=?, notes=?, updated_at=datetime('now') WHERE id=?`
+  ).bind(b.shipment_ref ?? t.shipment_ref, b.client ?? t.client, b.shipping_line ?? t.shipping_line,
+    b.agent ?? t.agent, b.type_of_entry ?? t.type_of_entry, b.penalty_amount != null ? num(b.penalty_amount) : t.penalty_amount,
+    b.currency ?? t.currency, b.do_receipt != null ? (truthy(b.do_receipt) ? 1 : 0) : t.do_receipt,
+    b.submission_date ?? t.submission_date, b.pic ?? t.pic, b.notes ?? t.notes, id).run();
+  await logActivity(env, { userId: user.id, action: "update", entityType: "penalty", entityId: id, ip });
+  return ok({ message: "تم تحديث الغرامة" });
+}
+async function deletePenalty(env, user, id, ip) {
+  if (!can(user, "writePenalties")) return err("لا تملك صلاحية", 403);
+  await env.DB.prepare(`DELETE FROM penalties WHERE id=?`).bind(id).run();
+  await logActivity(env, { userId: user.id, action: "delete", entityType: "penalty", entityId: id, ip });
+  return ok({ message: "تم حذف الغرامة" });
+}
+
+// =====================================================================
+//  الإشعارات
+// =====================================================================
+async function listNotifications(env, user) {
+  const { results } = await env.DB.prepare(
+    `SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 50`
+  ).bind(user.id).all();
+  const unread = results.filter((n) => !n.is_read).length;
+  return ok({ notifications: results, unread });
+}
+
+async function readNotification(env, user, id) {
+  await env.DB.prepare(`UPDATE notifications SET is_read=1 WHERE id=? AND user_id=?`).bind(id, user.id).run();
+  return ok({ message: "تم" });
+}
+
+async function readAllNotifications(env, user) {
+  await env.DB.prepare(`UPDATE notifications SET is_read=1 WHERE user_id=?`).bind(user.id).run();
+  return ok({ message: "تم" });
+}
+
+// =====================================================================
+//  لوحة المعلومات
+// =====================================================================
+async function dashboard(env, user) {
+  const byStatus = (await env.DB.prepare(
+    `SELECT status, COUNT(*) AS c FROM shipments GROUP BY status`
+  ).all()).results;
+
+  const totals = await env.DB.prepare(
+    `SELECT
+       (SELECT COUNT(*) FROM shipments) AS total_shipments,
+       (SELECT COUNT(*) FROM shipments WHERE status NOT IN ('closed','cancelled')) AS active_shipments,
+       (SELECT COUNT(*) FROM suppliers WHERE active=1) AS total_suppliers,
+       (SELECT COUNT(*) FROM users WHERE active=1) AS total_users`
+  ).first();
+
+  const recent = (await env.DB.prepare(
+    `SELECT s.id, s.ref_no, s.title, s.status, s.priority, s.created_at, sup.name AS supplier_name
+     FROM shipments s LEFT JOIN suppliers sup ON sup.id=s.supplier_id
+     ORDER BY s.created_at DESC LIMIT 8`
+  ).all()).results;
+
+  const myTasks = (await env.DB.prepare(
+    `SELECT id, ref_no, title, status, priority, eta FROM shipments
+     WHERE assigned_to=? AND status NOT IN ('closed','cancelled')
+     ORDER BY (priority='urgent') DESC, eta ASC LIMIT 10`
+  ).bind(user.id).all()).results;
+
+  return ok({ by_status: byStatus, totals, recent, my_tasks: myTasks });
+}
+
+// =====================================================================
+//  التقارير والتحليلات
+// =====================================================================
+async function reports(env, user) {
+  if (!can(user, "viewReports")) return err("لا تملك صلاحية", 403);
+  const byStatus = (await env.DB.prepare(`SELECT status, COUNT(*) AS c FROM shipments GROUP BY status ORDER BY c DESC`).all()).results;
+  const byClient = (await env.DB.prepare(
+    `SELECT cl.name AS client, COUNT(*) AS c FROM shipments s JOIN clients cl ON cl.id=s.client_id GROUP BY cl.id ORDER BY c DESC LIMIT 20`
+  ).all()).results;
+  const byMonth = (await env.DB.prepare(
+    `SELECT substr(eta,1,7) AS month, COUNT(*) AS c FROM shipments WHERE eta IS NOT NULL AND length(eta)>=7 GROUP BY month ORDER BY month DESC LIMIT 24`
+  ).all()).results;
+  const penByLine = (await env.DB.prepare(
+    `SELECT COALESCE(shipping_line,'غير محدد') AS line, COUNT(*) AS c, COALESCE(SUM(penalty_amount),0) AS total FROM penalties GROUP BY line ORDER BY total DESC LIMIT 15`
+  ).all()).results;
+  const penByClient = (await env.DB.prepare(
+    `SELECT COALESCE(client,'غير محدد') AS client, COUNT(*) AS c, COALESCE(SUM(penalty_amount),0) AS total FROM penalties GROUP BY client ORDER BY total DESC LIMIT 15`
+  ).all()).results;
+  const totals = await env.DB.prepare(
+    `SELECT (SELECT COUNT(*) FROM shipments) AS shipments,
+            (SELECT COUNT(*) FROM shipments WHERE status NOT IN ('closed','cancelled')) AS active,
+            (SELECT COUNT(*) FROM clients WHERE active=1) AS clients,
+            (SELECT COUNT(*) FROM customs_operations) AS customs_ops,
+            (SELECT COUNT(*) FROM penalties) AS penalties,
+            (SELECT COALESCE(SUM(penalty_amount),0) FROM penalties) AS penalties_total,
+            (SELECT COUNT(*) FROM shipments WHERE eta IS NOT NULL AND length(eta)>=7) AS with_eta`
+  ).first();
+  return ok({ by_status: byStatus, by_client: byClient, by_month: byMonth, pen_by_line: penByLine, pen_by_client: penByClient, totals });
+}
+
+// =====================================================================
+//  سجل النشاط
+// =====================================================================
+async function listActivity(request, env, user, url) {
+  if (!can(user, "manageUsers")) return err("لا تملك صلاحية", 403);
+  const limit = Math.min(200, parseInt(url.searchParams.get("limit") || "100", 10));
+  const { results } = await env.DB.prepare(
+    `SELECT a.*, u.full_name AS user_name FROM activity_log a
+     LEFT JOIN users u ON u.id=a.user_id ORDER BY a.created_at DESC LIMIT ?`
+  ).bind(limit).all();
+  return ok({ activity: results });
+}

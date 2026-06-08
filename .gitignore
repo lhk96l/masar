@@ -1,0 +1,15 @@
+node_modules/
+.wrangler/
+.dev.vars
+*.log
+.DS_Store
+backups/
+dist/tmp/
+*.local
+.env
+# بيانات سرّية مستوردة من الـ DSR — لا تُرفع للريبو العام أبداً
+db/import_*.sql
+_*.cjs
+
+# ملفات بيانات/إصلاحات تحوي بيانات حقيقية أو PII
+db/fix_*.sql

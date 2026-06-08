@@ -1,0 +1,30 @@
+# =====================================================================
+#  MASAR — Cloudflare Worker (API)
+#  الواجهة الأمامية تُستضاف على GitHub Pages؛ هذا الـ Worker هو الخادم.
+# =====================================================================
+name = "masar-api"
+main = "worker/index.js"
+compatibility_date = "2025-01-01"
+workers_dev = true
+
+# قاعدة بيانات D1 (تُملأ id بعد: npm run db:create)
+[[d1_databases]]
+binding = "DB"
+database_name = "masar-db"
+database_id = "659bd0ab-4dc6-4f12-ba72-9601f1041f84"
+
+# تخزين المستندات (الفواتير، بوالص الشحن...) في R2
+# مُعطّل مؤقتاً حتى تفعيل R2 من لوحة Cloudflare، ثم نزيل التعليق ونعيد النشر:
+#   npx wrangler r2 bucket create masar-docs && npx wrangler deploy
+# [[r2_buckets]]
+# binding = "DOCS"
+# bucket_name = "masar-docs"
+
+# متغيرات عامة غير سرّية
+[vars]
+APP_NAME = "MASAR"
+ORG_NAME = "شركة عبر الشرق للخدمات النفطية"
+
+# الأسرار (تُضبط عبر: wrangler secret put <NAME>) — لا تُكتب هنا أبداً:
+#   JWT_SECRET     سرّ توقيع الجلسات (HMAC-SHA256)
+#   SETUP_TOKEN    توكن لمرة واحدة لإنشاء أول مدير عبر /api/setup

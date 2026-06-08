@@ -1,0 +1,23 @@
+{
+  "name": "masar",
+  "version": "1.0.0",
+  "description": "MASAR — نظام إدارة العمليات والشحنات | شركة عبر الشرق النفطية",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:create": "wrangler d1 create masar-db",
+    "db:schema": "wrangler d1 execute masar-db --remote --file=./db/schema.sql",
+    "db:schema:local": "wrangler d1 execute masar-db --local --file=./db/schema.sql",
+    "db:seed": "wrangler d1 execute masar-db --remote --file=./db/seed.sql",
+    "db:backup": "node scripts/backup.cjs",
+    "tail": "wrangler tail"
+  },
+  "author": "م. مهند المظفر — قسم التكنولوجيا، شركة عبر الشرق النفطية",
+  "license": "MIT",
+  "devDependencies": {
+    "wrangler": "^4.0.0",
+    "xlsx": "^0.18.5"
+  }
+}
