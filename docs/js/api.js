@@ -157,6 +157,7 @@ export const API = {
   // اللوحة والنشاط
   dashboard: () => request("GET", "/api/dashboard"),
   reports: () => request("GET", "/api/reports"),
+  quality: () => request("GET", "/api/quality"),
   syncStatus: () => request("GET", "/api/sync/status"),
   syncChanges: (qs = "") => request("GET", `/api/sync/changes${qs}`),
   activity: (qs = "") => request("GET", `/api/activity${qs}`),

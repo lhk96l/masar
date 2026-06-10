@@ -542,6 +542,9 @@ async function route(request, env, url) {
   // ---------- التقارير ----------
   if (path === "/api/reports" && method === "GET") return reports(env, user);
 
+  // ---------- جودة البيانات ----------
+  if (path === "/api/quality" && method === "GET") return dataQuality(env, user);
+
   // ---------- حالة المزامنة وسجل التغييرات ----------
   if (path === "/api/sync/status" && method === "GET") return syncStatus(env, user);
   if (path === "/api/sync/changes" && method === "GET") return syncChanges(request, env, user, url);
@@ -1738,6 +1741,38 @@ async function listActivity(request, env, user, url) {
      LEFT JOIN users u ON u.id=a.user_id ORDER BY a.created_at DESC LIMIT ?`
   ).bind(limit).all();
   return ok({ activity: results });
+}
+
+// =====================================================================
+//  جودة البيانات (يكشف الناقص للموظفين ليُكملوه)
+// =====================================================================
+async function dataQuality(env, user){
+  if(!can(user,"writeShipments") && !can(user,"manageUsers")) return err("لا تملك صلاحية", 403);
+  const W = "WHERE s.status NOT IN ('closed','cancelled')";
+  const summary = await env.DB.prepare(
+    `SELECT COUNT(*) AS total,
+       SUM(CASE WHEN s.assigned_to IS NULL THEN 1 ELSE 0 END) AS no_assigned,
+       SUM(CASE WHEN s.shipping_line IS NULL OR s.shipping_line='' THEN 1 ELSE 0 END) AS no_line,
+       SUM(CASE WHEN s.eta IS NULL THEN 1 ELSE 0 END) AS no_eta,
+       SUM(CASE WHEN s.client_id IS NULL THEN 1 ELSE 0 END) AS no_client,
+       SUM(CASE WHEN s.bl_no IS NULL OR s.bl_no='' THEN 1 ELSE 0 END) AS no_bl,
+       SUM(CASE WHEN s.container_no IS NULL OR s.container_no='' THEN 1 ELSE 0 END) AS no_container,
+       SUM(CASE WHEN s.destination IS NULL OR s.destination='' THEN 1 ELSE 0 END) AS no_destination
+     FROM shipments s ${W}`
+  ).first();
+  const list = async (cond) => (await env.DB.prepare(
+    `SELECT s.id, s.ref_no, s.title, s.status, c.name AS client_name, u.full_name AS assigned_name
+     FROM shipments s LEFT JOIN clients c ON c.id=s.client_id LEFT JOIN users u ON u.id=s.assigned_to
+     ${W} AND ${cond} ORDER BY s.created_at DESC LIMIT 100`
+  ).all()).results;
+  const lists = {
+    no_assigned: await list("s.assigned_to IS NULL"),
+    no_line: await list("(s.shipping_line IS NULL OR s.shipping_line='')"),
+    no_eta: await list("s.eta IS NULL"),
+    no_client: await list("s.client_id IS NULL"),
+    no_bl: await list("(s.bl_no IS NULL OR s.bl_no='')"),
+  };
+  return ok({ summary, lists });
 }
 
 // =====================================================================

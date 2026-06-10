@@ -18,6 +18,7 @@ import { renderPenalties } from "./modules/penalties.js";
 import { renderCustomsOps } from "./modules/customsops.js";
 import { renderReports } from "./modules/reports.js";
 import { renderSync } from "./modules/sync.js";
+import { renderQuality } from "./modules/quality.js";
 
 // مصفوفة الصلاحيات (نسخة من الخادم لإخفاء/إظهار العناصر فقط — الخادم هو الحَكم)
 const PERM = {
@@ -50,6 +51,7 @@ const NAV = [
   { hash: "#/dashboard", label: "لوحة المعلومات", icon: "📊" },
   { hash: "#/alerts", label: "التنبيهات", icon: "🔔" },
   { hash: "#/reports", label: "التقارير", icon: "📊", perm: "viewReports" },
+  { hash: "#/quality", label: "جودة البيانات", icon: "🧪", perm: "writeShipments" },
   { hash: "#/shipments", label: "الشحنات", icon: "📦" },
   { hash: "#/customs", label: "التخليص الكمركي", icon: "🛃", perm: "writeCustoms" },
   { hash: "#/customs-ops", label: "عمليات الكمارك (CD/LB)", icon: "📜", perm: "writeCustomsOps" },
@@ -311,6 +313,7 @@ async function router() {
     if (path === "#/alerts") return renderAlerts(content, app);
     if (path === "#/reports") return renderReports(content, app);
     if (path === "#/sync") return renderSync(content, app);
+    if (path === "#/quality") return renderQuality(content, app);
     if (path === "#/shipments") return renderShipmentList(content, app);
     if (path === "#/shipments/new") return renderShipmentForm(content, app, null);
     if ((m = path.match(/^#\/shipments\/(\d+)\/edit$/))) return renderShipmentForm(content, app, +m[1]);
