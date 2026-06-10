@@ -342,6 +342,11 @@ async function route(request, env, url) {
     return handleLogin(request, env, ip);
   }
 
+  // ---------- مزامنة Google Sheets (محمية برمز SYNC_TOKEN) ----------
+  if (path === "/api/sync/ingest" && method === "POST") {
+    return ingestSync(request, env);
+  }
+
   // كل ما بعده يتطلب مصادقة
   const user = await authenticate(request, env);
   if (!user) return err("غير مصرّح — سجّل الدخول", 401);
@@ -1725,4 +1730,244 @@ async function listActivity(request, env, user, url) {
      LEFT JOIN users u ON u.id=a.user_id ORDER BY a.created_at DESC LIMIT ?`
   ).bind(limit).all();
   return ok({ activity: results });
+}
+
+// =====================================================================
+//  مزامنة Google Sheets → MASAR (التوجيه + التحويل + كشف التغيير)
+// =====================================================================
+const GS_MO = { jan:"01",feb:"02",mar:"03",apr:"04",may:"05",jun:"06",jul:"07",aug:"08",sep:"09",oct:"10",nov:"11",dec:"12" };
+function gsDate(v) {
+  if (v == null) return null;
+  const s = String(v).trim(); if (!s) return null;
+  let m = s.match(/^(\d{1,2})[-\/ ]([A-Za-z]{3,})[-\/ ](\d{4})$/);
+  if (m) { const mo = GS_MO[m[2].slice(0,3).toLowerCase()]; if (mo) return `${m[3]}-${mo}-${m[1].padStart(2,"0")}`; }
+  m = s.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})/); if (m) return `${m[1]}-${m[2].padStart(2,"0")}-${m[3].padStart(2,"0")}`;
+  m = s.match(/^(\d{1,2})[.\/](\d{1,2})[.\/](\d{4})$/); if (m) return `${m[3]}-${m[2].padStart(2,"0")}-${m[1].padStart(2,"0")}`;
+  return null;
+}
+function gsNum(v) { if (v == null) return null; const s = String(v).replace(/[^\d.\-]/g,""); if (s===""||s==="-") return null; const n = Number(s); return isNaN(n)?null:n; }
+function gsInt(v) { const n = gsNum(v); return n==null?null:Math.round(n); }
+function gsMoney(v) { if (!v) return { amt:null, cur:null }; const s=String(v); const cur=(s.match(/IQD|USD|EUR|AED/i)||[null])[0]; return { amt:gsNum(s), cur:cur?cur.toUpperCase():null }; }
+function gsImport(v) { const s=String(v||"").toLowerCase(); if(s.includes("perm"))return"permanent"; if(s.includes("ddp"))return"ddp"; if(s.includes("temp"))return"temporary"; if(s.includes("re-ex")||s.includes("reex"))return"reexport"; if(s.includes("licen"))return"import_license"; if(s.includes("renew"))return"renewal"; if(s.includes("cour"))return"courier"; return null; }
+function gsMode(v) { const s=String(v||"").toLowerCase(); if(s.includes("sea"))return"sea"; if(s.includes("air"))return"air"; if(s.includes("land")||s.includes("road"))return"land"; return null; }
+function gsStatus(v) { const s=String(v||"").toLowerCase(); if(s.includes("cancel")||s.includes("ملغ"))return"cancelled"; if(s.includes("deliver")||s.includes("تسليم")||s.includes("سلم"))return"delivered"; return"opened"; }
+function gsBool(v){ return /^(true|1|yes|نعم|y)$/i.test(String(v||"").trim()); }
+function gsClean(v){ if(v==null) return null; const s=String(v).replace(/\s+/g," ").trim(); if(!s||/^(na|n\/a|true|false)$/i.test(s)) return null; return s; }
+// getter بتطابق جزئي لاسم العمود (للعناوين ثنائية اللغة)
+function gp(row, ...subs){ for(const s of subs){ const k=Object.keys(row).find(k=>k.includes(s)); if(k && String(row[k]).trim()!=="") return row[k]; } return ""; }
+async function sha256hex(str){ const b=await crypto.subtle.digest("SHA-256", enc.encode(str)); return [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,"0")).join(""); }
+
+async function dbInsert(env, table, fields){
+  const cols=Object.keys(fields), vals=cols.map(c=>fields[c]);
+  const res=await env.DB.prepare(`INSERT INTO ${table} (${cols.join(",")}) VALUES (${cols.map(()=>"?").join(",")})`).bind(...vals).run();
+  return res.meta.last_row_id;
+}
+async function dbUpdate(env, table, fields, id){
+  const cols=Object.keys(fields), vals=cols.map(c=>fields[c]);
+  await env.DB.prepare(`UPDATE ${table} SET ${cols.map(c=>`${c}=?`).join(",")}, updated_at=datetime('now') WHERE id=?`).bind(...vals, id).run();
+}
+async function ensureClient(env, name, cache){
+  name = gsClean(name); if(!name) return null;
+  if(cache && cache.has(name)) return cache.get(name);
+  await env.DB.prepare(`INSERT INTO clients (name, created_by) SELECT ?,1 WHERE NOT EXISTS (SELECT 1 FROM clients WHERE name=?)`).bind(name,name).run();
+  const r=await env.DB.prepare(`SELECT id FROM clients WHERE name=? LIMIT 1`).bind(name).first();
+  const id=r?r.id:null; if(cache) cache.set(name,id); return id;
+}
+async function ensureCarrier(env, name){
+  name=gsClean(name); if(!name) return name;
+  await env.DB.prepare(`INSERT INTO carriers (name, created_by) SELECT ?,1 WHERE NOT EXISTS (SELECT 1 FROM carriers WHERE name=?)`).bind(name,name).run();
+  return name;
+}
+// المزامنة الموحّدة: insert/update عبر sync_state + مطابقة الموجود
+async function syncOne(env, key, hash, entityType, fields, table, reconcileId){
+  const st=await env.DB.prepare(`SELECT hash, entity_id FROM sync_state WHERE sync_key=?`).bind(key).first();
+  if(st && st.hash===hash) return "skip";
+  let id = st ? st.entity_id : null;
+  let wasUpdate = !!st;
+  if(!id && reconcileId){ const ex=await reconcileId(); if(ex){ id=ex; wasUpdate=true; } }
+  if(id){ await dbUpdate(env, table, fields, id); }
+  else { id = await dbInsert(env, table, fields); }
+  await env.DB.prepare(`INSERT INTO sync_state (sync_key,hash,entity_type,entity_id) VALUES (?,?,?,?)
+    ON CONFLICT(sync_key) DO UPDATE SET hash=excluded.hash, entity_id=excluded.entity_id, updated_at=datetime('now')`).bind(key,hash,entityType,id).run();
+  return wasUpdate ? "update" : "insert";
+}
+
+function routeTab(name, headers){
+  const n=String(name||"").trim().toLowerCase();
+  const has=(s)=>headers.some(h=>String(h).includes(s));
+  if(n.includes("customs operations")) return "customs_op";
+  if(n==="booking") return "transport";
+  if(has("Penalty Amount")) return "penalty";
+  if(has("Shipment Ref. #")) return "shipment";
+  return "none";
+}
+
+async function ingestSync(request, env){
+  const token=request.headers.get("X-Sync-Token")||"";
+  if(!env.SYNC_TOKEN || token.trim()!==env.SYNC_TOKEN.trim()) return err("رمز المزامنة غير صحيح", 403);
+  const body=await request.json().catch(()=>null);
+  if(!body || !Array.isArray(body.sheets)) return err("صيغة غير صحيحة (sheets مطلوب)", 400);
+  const stats={ inserted:0, updated:0, skipped:0, errors:0, tabs:{} };
+  const clientCache=new Map();
+  for(const sheet of body.sheets){
+    try{
+      const headers=(sheet.headers||[]).map(h=>String(h==null?"":h).trim());
+      const rows=(sheet.rows||[]).map(r=>{ const o={}; headers.forEach((h,i)=>{ if(h) o[h]=r[i]; }); return o; });
+      const type=routeTab(sheet.name, headers);
+      let res={ins:0,upd:0,skip:0};
+      if(type==="shipment") res=await syncShipments(env, sheet.name, rows, clientCache);
+      else if(type==="customs_op") res=await syncCustomsOps(env, rows, clientCache);
+      else if(type==="penalty") res=await syncPenalties(env, rows);
+      else if(type==="transport") res=await syncTransport(env, rows);
+      else { stats.tabs[sheet.name]="تخطّي"; continue; }
+      stats.inserted+=res.ins; stats.updated+=res.upd; stats.skipped+=res.skip;
+      stats.tabs[sheet.name]=`+${res.ins} ~${res.upd} =${res.skip}`;
+    }catch(e){ stats.errors++; stats.tabs[sheet.name]="خطأ: "+(e.message||e); }
+  }
+  try{ await env.DB.prepare(`INSERT INTO sync_log (source, inserted, updated, skipped, errors, detail) VALUES (?,?,?,?,?,?)`)
+    .bind(body.source||null, stats.inserted, stats.updated, stats.skipped, stats.errors, JSON.stringify(stats.tabs).slice(0,1800)).run(); }catch(_){}
+  return ok({ message:"تمت المزامنة", ...stats });
+}
+
+const SPECIAL_TABS=["spot shipment","re-export","inter. re-export"];
+async function syncShipments(env, tabName, rows, clientCache){
+  let ins=0,upd=0,skip=0;
+  const isSpecial=SPECIAL_TABS.includes(String(tabName||"").trim().toLowerCase());
+  const isReexport=String(tabName||"").toLowerCase().includes("re-export");
+  for(const r of rows){
+    const ref=(gsClean(r["Shipment Ref. #"])|| (gsClean(r["BL #"])?("BL-"+gsClean(r["BL #"])):null));
+    if(!ref) continue;
+    const clientName = gsClean(r["Client"]) || (isSpecial?null:tabName);
+    const clientId = await ensureClient(env, clientName, clientCache);
+    const cargo=gsClean(r["Cargo Description"]);
+    const notesParts=[];
+    if(gsClean(r["Status"])) notesParts.push("حالة الشيت: "+gsClean(r["Status"]));
+    if(gsClean(r["Remarks"])) notesParts.push("ملاحظات: "+gsClean(r["Remarks"]));
+    if(gsClean(r["PIC"])) notesParts.push("PIC: "+gsClean(r["PIC"]));
+    if(gsClean(r["Hs Code"])) notesParts.push("HS: "+gsClean(r["Hs Code"]));
+    const dep=gsMoney(r["SL Deposit"]);
+    const f={
+      ref_no:ref, title:(cargo?cargo.slice(0,80):ref), client_id:clientId,
+      status:gsStatus(r["Status"]), importation_type:(isReexport?"reexport":gsImport(r["Importation Type"])),
+      transport_mode:gsMode(r["Mode"]), shipping_line:gsClean(r["Shipping Line Agent"]),
+      destination:gsClean(r["Destination"]), bl_no:gsClean(r["BL #"]), container_no:gsClean(r["Container#"]),
+      vessel_name:gsClean(r["VSL name and VOY#"]), goods_description:cargo,
+      call_off:gsClean(r["Call Off"]), call_off_date:gsDate(r["Call Off Date"]),
+      eta:gsDate(r["Vessel ETA"]), etd:gsDate(r["Vessel ETD"]), vessel_ata:gsDate(r["Vessel ATA"]),
+      docs_submission_date:gsDate(r["Docs Submission Date"]), do1_date:gsDate(r["1st DO Date"]),
+      do2_date:gsDate(r["2nd DO Date"]), do2_no:gsClean(r["2nd DO #"]),
+      trailer_booking_date:gsDate(r["Trailer Booking Date"]), trailer_entry_date:gsDate(r["Trailer Entry Date"]),
+      loading_date:gsDate(r["Loading Date"]), releasing_date:gsDate(r["Releasing Date"]),
+      arrival_site_date:gsDate(r["Arrival to Site Date"]),
+      offloading_pod_date:gsDate(r["Off Loading/POD Date"]||r["Off loading / POD Date"]),
+      return_token_date:gsDate(r["Return Token Date"]), cc_receipt_date:gsDate(r["CC Receipt Receive Date"]),
+      finance_settlement_date:gsDate(r["Finance Settlement Date"]),
+      handover_account_date:gsDate(r["HandOver Receipt and Docs to Account dept."]),
+      accounting_invoice_date:gsDate(r["Accounting Invoice to Client Date"]),
+      deposit_receipt_date:gsDate(r["Deposit Receipt Receive Date"]),
+      cont_20std:gsInt(r["20 STD"]||r["20"]), cont_20fr:gsInt(r["20 FR"]), cont_20ot:gsInt(r["20 OT"]),
+      cont_40std:gsInt(r["40 STD"]||r["40"]), cont_40fr:gsInt(r["40 FR"]), cont_40ot:gsInt(r["40 OT"]),
+      cont_45:gsInt(r["45 STD"]||r["45"]), lcl:gsInt(r["LCL"]), roro:gsInt(r["RORO"]),
+      cbm:gsNum(r["CBM"]), weight_kg:gsNum(r["GW"]), total_pkgs:gsInt(r["Total PKGs if BB"]),
+      total_trailers:gsInt(r["Total required Trailers"]||r["Total Trailers"]), packaging_type:gsClean(r["Type of Packaging"]),
+      sl_deposit:dep.amt, deposit_currency:dep.cur, sl_deducted:gsMoney(r["Amount Deducted"]).amt, sl_returned:gsMoney(r["Returned Balance"]).amt,
+      pre_alert_date:gsDate(r["Pre-alert Recieved from Client"]), docs_to_org_date:gsDate(r["Docs Submitted to Operation Org."]),
+      exemption_approval:gsClean(r["Exemption Approval"]), transit_through:gsClean(r["Through"]),
+      notes:(notesParts.join(" | ").slice(0,900)||null), created_by:1,
+    };
+    const key="shipment:"+ref;
+    const hash=await sha256hex(JSON.stringify(f));
+    const res=await syncOne(env, key, hash, "shipment", f, "shipments",
+      async()=>{ const e=await env.DB.prepare(`SELECT id FROM shipments WHERE ref_no=?`).bind(ref).first(); return e?e.id:null; });
+    if(res==="insert")ins++; else if(res==="update")upd++; else skip++;
+  }
+  return {ins,upd,skip};
+}
+
+async function syncCustomsOps(env, rows, clientCache){
+  let ins=0,upd=0,skip=0;
+  for(const r of rows){
+    const abr=gsClean(r["ABR Ref#"]); const cd=gsClean(r["CD #"]); const lb=gsClean(r["LB #"]);
+    if(!abr && !cd && !lb) continue;
+    const handover=gsBool(r["Hand Overed to Client?"]); const inv=gsDate(r["Invoice to Client Date"]);
+    const status=(handover||inv)?"done":(gsDate(r["Process Start Date"])?"in_progress":"open");
+    const f={
+      abr_ref:abr, job_type:gsClean(r["Job Type"]), client_id:await ensureClient(env, r["Client"], clientCache),
+      pic:gsClean(r["PIC"]), operation_org:gsClean(r["Operation Organisation"]), oil_company:gsClean(r["Oil Company"]),
+      contract_no:gsClean(r["Contract#"]), qty_cdlb:gsClean(gp(r,"QTY")),
+      cd_no:cd, cd_last_expire:gsDate(r["CD Last Expire Date"]), cd_new_expire:gsDate(r["CD New Expire Date"]),
+      lb_no:lb, lb_last_expire:gsDate(r["LB Last Expire Date"]), lb_new_expire:gsDate(r["LB New Expire Date"]),
+      process_start_date:gsDate(r["Process Start Date"]), process_end_date:gsDate(r["Process End Date"]),
+      handover_to_client:handover?1:0, pod_signed:gsBool(r["POD Signed?"])?1:0,
+      handover_account_date:gsDate(gp(r,"Hand Over Date")), receive_account_date:gsDate(gp(r,"Recieve from Ac","Receive from Ac")),
+      invoice_client_date:inv, status, notes:gsClean(r["Process Updates"]), created_by:1,
+    };
+    const key="custop:"+(abr||"")+"|"+(cd||"")+"|"+(lb||"");
+    const hash=await sha256hex(JSON.stringify(f));
+    const res=await syncOne(env, key, hash, "customs_op", f, "customs_operations",
+      async()=>{ const e=await env.DB.prepare(`SELECT id FROM customs_operations WHERE abr_ref IS ? AND cd_no IS ? AND lb_no IS ? LIMIT 1`).bind(abr,cd,lb).first(); return e?e.id:null; });
+    if(res==="insert")ins++; else if(res==="update")upd++; else skip++;
+  }
+  return {ins,upd,skip};
+}
+
+async function syncPenalties(env, rows){
+  let ins=0,upd=0,skip=0;
+  for(const r of rows){
+    const ref=gsClean(gp(r,"Shipment Ref")); const amt=gsNum(gp(r,"Penalty Amount"));
+    if(!ref && amt==null) continue;
+    let shipmentId=null;
+    if(ref){ const s=await env.DB.prepare(`SELECT id FROM shipments WHERE ref_no=?`).bind(ref).first(); shipmentId=s?s.id:null; }
+    const sub=gsDate(gp(r,"تاريخ التقديم","Submission"));
+    const f={
+      shipment_id:shipmentId, shipment_ref:ref, client:gsClean(r["Client"]),
+      shipping_line:gsClean(gp(r,"Shipping Line")), agent:gsClean(gp(r,"الوكالة","اسم الوكالة")),
+      type_of_entry:gsClean(r["Type of Entry"]), penalty_amount:(amt==null?0:amt), currency:"IQD",
+      do_receipt:gsBool(gp(r,"امر التسليم","الوصل"))?1:0, submission_date:sub, pic:gsClean(r["PIC"]), created_by:1,
+    };
+    const key="penalty:"+(ref||"")+"|"+(amt==null?"":amt)+"|"+(sub||"");
+    const hash=await sha256hex(JSON.stringify(f));
+    const res=await syncOne(env, key, hash, "penalty", f, "penalties", null);
+    if(res==="insert")ins++; else if(res==="update")upd++; else skip++;
+  }
+  return {ins,upd,skip};
+}
+
+const GS_CARRIERS=[["سيارات عبر الشرق","سيارات عبر الشرق"],["عبدالله","الناقل عبدالله"],["علي نجيب","علي نجيب"],["راجي","راجي"],["سيف","سيف"],["علي راضي","علي راضي"],["أبو حيدر","أبو حيدر"],["بيت الهارف","بيت الهارف"]];
+async function syncTransport(env, rows){
+  let ins=0,upd=0,skip=0;
+  for(const r of rows){
+    const ref=gsClean(gp(r,"Shipment #","Shipment"));
+    if(!ref) continue;
+    const s=await env.DB.prepare(`SELECT id FROM shipments WHERE ref_no=?`).bind(ref).first();
+    const shipmentId=s?s.id:null;
+    const dispatch=gsDate(gp(r,"دخول السيارة")); const deliver=gsDate(gp(r,"الوصول للموقع"));
+    const cret=gsDate(gp(r,"Container Return")); const pod=gsDate(gp(r,"التفريغ وتوقيع"));
+    const status=pod?"delivered":(dispatch?"in_transit":"assigned");
+    const dest=gsClean(gp(r,"Destination","مكان التفريغ"));
+    const notes=[gsClean(r["DO#"])?("DO: "+gsClean(r["DO#"])):"", gsClean(r["الملاحظات"])||""].filter(Boolean).join(" | ")||null;
+    let made=false;
+    for(const [colSub, cname] of GS_CARRIERS){
+      const cnt=gsInt(gp(r, colSub)); if(!cnt) continue;
+      await ensureCarrier(env, cname);
+      const f={ shipment_id:shipmentId, carrier:cname, booked_trailers:cnt, delivery_location:dest,
+        dispatch_date:dispatch, delivery_date:deliver, container_return_date:cret,
+        eir_received:gp(r,"EIR")?1:0, in_storage:gsBool(gp(r,"In Storage","في الخزن"))?1:0, status, notes, created_by:1 };
+      const key="transport:"+ref+"|"+cname;
+      const hash=await sha256hex(JSON.stringify(f));
+      const res=await syncOne(env, key, hash, "transport", f, "transport_orders", null);
+      if(res==="insert")ins++; else if(res==="update")upd++; else skip++;
+      made=true;
+    }
+    if(!made){
+      const f={ shipment_id:shipmentId, booked_trailers:gsInt(gp(r,"Total Trailers")), delivery_location:dest,
+        dispatch_date:dispatch, delivery_date:deliver, container_return_date:cret,
+        eir_received:gp(r,"EIR")?1:0, in_storage:gsBool(gp(r,"In Storage","في الخزن"))?1:0, status, notes, created_by:1 };
+      const key="transport:"+ref+"|_";
+      const hash=await sha256hex(JSON.stringify(f));
+      const res=await syncOne(env, key, hash, "transport", f, "transport_orders", null);
+      if(res==="insert")ins++; else if(res==="update")upd++; else skip++;
+    }
+  }
+  return {ins,upd,skip};
 }
