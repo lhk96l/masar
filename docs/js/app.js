@@ -5,6 +5,7 @@ import { CONFIG } from "./config.js";
 import { API, Session, ApiError } from "./api.js";
 import { esc, timeAgo, toast, modal, closeModal, field, spinner, emptyState, ROLE_LABELS, fmtDateTime } from "./ui.js";
 import { renderDashboard } from "./modules/dashboard.js";
+import { renderMyWork } from "./modules/mywork.js";
 import { renderShipmentList, renderShipmentForm, renderShipmentDetail } from "./modules/shipments.js";
 import { renderSuppliers } from "./modules/suppliers.js";
 import { renderClients } from "./modules/clients.js";
@@ -48,6 +49,7 @@ const app = {
 };
 
 const NAV = [
+  { hash: "#/mywork", label: "لوحتي", icon: "🏠" },
   { hash: "#/dashboard", label: "لوحة المعلومات", icon: "📊" },
   { hash: "#/alerts", label: "التنبيهات", icon: "🔔" },
   { hash: "#/reports", label: "التقارير", icon: "📊", perm: "viewReports" },
@@ -129,7 +131,7 @@ async function showAuth() {
       const res = await API.login({ username, password });
       Session.token = res.token; Session.user = res.user;
       if (res.user.must_change) return showChangePassword(true);
-      renderShell(); location.hash = "#/dashboard"; router();
+      renderShell(); location.hash = "#/mywork"; router();
     } catch (err) {
       toast(err.message, "error"); btn.disabled = false; btn.textContent = "دخول";
     }
@@ -183,7 +185,7 @@ function showChangePassword(forced = false) {
       await API.changePassword(body);
       const u = Session.user; if (u) { u.must_change = 0; Session.user = u; }
       toast("تم تغيير كلمة المرور", "success");
-      renderShell(); location.hash = "#/dashboard"; router();
+      renderShell(); location.hash = "#/mywork"; router();
     } catch (err) { toast(err.message, "error"); }
   };
 }
@@ -309,7 +311,8 @@ async function router() {
 
   try {
     let m;
-    if (path === "#/" || path === "#/dashboard") return renderDashboard(content, app);
+    if (path === "#/" || path === "#/mywork") return renderMyWork(content, app);
+    if (path === "#/dashboard") return renderDashboard(content, app);
     if (path === "#/alerts") return renderAlerts(content, app);
     if (path === "#/reports") return renderReports(content, app);
     if (path === "#/sync") return renderSync(content, app);

@@ -614,6 +614,7 @@ async function route(request, env, url) {
 
   // ---------- لوحة المعلومات ----------
   if (path === "/api/dashboard" && method === "GET") return dashboard(env, user);
+  if (path === "/api/mywork" && method === "GET") return myWork(env, user);
 
   // ---------- التقارير ----------
   if (path === "/api/reports" && method === "GET") return reports(env, user);
@@ -1804,6 +1805,35 @@ async function reports(env, user) {
             (SELECT COUNT(*) FROM shipments WHERE eta IS NOT NULL AND length(eta)>=7) AS with_eta`
   ).first();
   return ok({ by_status: byStatus, by_client: byClient, by_month: byMonth, pen_by_line: penByLine, pen_by_client: penByClient, totals });
+}
+
+// =====================================================================
+//  لوحتي (الشخصية لكل موظف)
+// =====================================================================
+async function myWork(env, user){
+  const uid = user.id;
+  const active = (await env.DB.prepare(
+    `SELECT s.id, s.ref_no, s.title, s.status, s.priority, s.eta, cl.name AS client_name, s.latest_update
+     FROM shipments s LEFT JOIN clients cl ON cl.id=s.client_id
+     WHERE s.assigned_to=? AND s.status NOT IN ('closed','cancelled')
+     ORDER BY (s.priority='urgent') DESC, s.eta ASC LIMIT 100`).bind(uid).all()).results;
+  const byStatus = (await env.DB.prepare(
+    `SELECT status, COUNT(*) c FROM shipments WHERE assigned_to=? GROUP BY status`).bind(uid).all()).results;
+  const overdue = (await env.DB.prepare(
+    `SELECT s.id, s.ref_no, s.title, s.eta, cl.name AS client_name FROM shipments s LEFT JOIN clients cl ON cl.id=s.client_id
+     WHERE s.assigned_to=? AND s.eta IS NOT NULL AND s.eta < date('now') AND s.status NOT IN ('delivered','closed','cancelled')
+     ORDER BY s.eta ASC LIMIT 50`).bind(uid).all()).results;
+  const attention = (await env.DB.prepare(
+    `SELECT s.id, s.ref_no, s.title,
+       (CASE WHEN s.shipping_line IS NULL OR s.shipping_line='' THEN 'خط ملاحي ' ELSE '' END ||
+        CASE WHEN s.eta IS NULL THEN 'ETA ' ELSE '' END ||
+        CASE WHEN s.bl_no IS NULL OR s.bl_no='' THEN 'بوليصة ' ELSE '' END) AS missing
+     FROM shipments s WHERE s.assigned_to=? AND s.status NOT IN ('closed','cancelled')
+       AND (s.shipping_line IS NULL OR s.shipping_line='' OR s.eta IS NULL OR s.bl_no IS NULL OR s.bl_no='')
+     ORDER BY s.created_at DESC LIMIT 50`).bind(uid).all()).results;
+  const unread = (await env.DB.prepare(`SELECT COUNT(*) c FROM notifications WHERE user_id=? AND is_read=0`).bind(uid).first()).c;
+  return ok({ active, by_status: byStatus, overdue, attention, unread,
+    totals: { active: active.length, overdue: overdue.length, attention: attention.length } });
 }
 
 // =====================================================================
