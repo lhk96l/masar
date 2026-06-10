@@ -157,6 +157,7 @@ export const API = {
   // اللوحة والنشاط
   dashboard: () => request("GET", "/api/dashboard"),
   myWork: () => request("GET", "/api/mywork"),
+  aiAsk: (question) => request("POST", "/api/ai/ask", { question }),
   reports: () => request("GET", "/api/reports"),
   quality: () => request("GET", "/api/quality"),
   syncStatus: () => request("GET", "/api/sync/status"),

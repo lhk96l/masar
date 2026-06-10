@@ -7,6 +7,10 @@ main = "worker/index.js"
 compatibility_date = "2025-01-01"
 workers_dev = true
 
+# الذكاء الاصطناعي (Cloudflare Workers AI — مجاني، للمساعد الذكي)
+[ai]
+binding = "AI"
+
 # قاعدة بيانات D1 (تُملأ id بعد: npm run db:create)
 [[d1_databases]]
 binding = "DB"

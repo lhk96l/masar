@@ -20,6 +20,7 @@ import { renderCustomsOps } from "./modules/customsops.js";
 import { renderReports } from "./modules/reports.js";
 import { renderSync } from "./modules/sync.js";
 import { renderQuality } from "./modules/quality.js";
+import { renderAI } from "./modules/ai.js";
 
 // مصفوفة الصلاحيات (نسخة من الخادم لإخفاء/إظهار العناصر فقط — الخادم هو الحَكم)
 const PERM = {
@@ -50,6 +51,7 @@ const app = {
 
 const NAV = [
   { hash: "#/mywork", label: "لوحتي", icon: "🏠" },
+  { hash: "#/ai", label: "المساعد الذكي", icon: "🤖" },
   { hash: "#/dashboard", label: "لوحة المعلومات", icon: "📊" },
   { hash: "#/alerts", label: "التنبيهات", icon: "🔔" },
   { hash: "#/reports", label: "التقارير", icon: "📊", perm: "viewReports" },
@@ -313,6 +315,7 @@ async function router() {
     let m;
     if (path === "#/" || path === "#/mywork") return renderMyWork(content, app);
     if (path === "#/dashboard") return renderDashboard(content, app);
+    if (path === "#/ai") return renderAI(content, app);
     if (path === "#/alerts") return renderAlerts(content, app);
     if (path === "#/reports") return renderReports(content, app);
     if (path === "#/sync") return renderSync(content, app);

@@ -616,6 +616,9 @@ async function route(request, env, url) {
   if (path === "/api/dashboard" && method === "GET") return dashboard(env, user);
   if (path === "/api/mywork" && method === "GET") return myWork(env, user);
 
+  // ---------- المساعد الذكي ----------
+  if (path === "/api/ai/ask" && method === "POST") return aiAsk(request, env, user);
+
   // ---------- التقارير ----------
   if (path === "/api/reports" && method === "GET") return reports(env, user);
 
@@ -1805,6 +1808,99 @@ async function reports(env, user) {
             (SELECT COUNT(*) FROM shipments WHERE eta IS NOT NULL AND length(eta)>=7) AS with_eta`
   ).first();
   return ok({ by_status: byStatus, by_client: byClient, by_month: byMonth, pen_by_line: penByLine, pen_by_client: penByClient, totals });
+}
+
+// =====================================================================
+//  المساعد الذكي (Cloudflare Workers AI — هجين: فهم بالـ AI + بيانات حقيقية)
+// =====================================================================
+const AI_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+async function aiAsk(request, env, user){
+  if(!env.AI) return err("خدمة الذكاء غير مفعّلة بعد", 503);
+  const { question } = await request.json().catch(()=>({}));
+  const q = (question||"").trim();
+  if(!q) return err("اكتب سؤالاً", 400);
+
+  const sys = `أنت مساعد لنظام MASAR لإدارة الشحنات لشركة عبر الشرق. مهمتك تحويل سؤال المستخدم إلى JSON فقط (بلا أي نص آخر) بالشكل:
+{"intent":"...","params":{...}}
+الأنواع المتاحة (intent):
+- "shipment_status": params {"ref":"رقم الشحنة"} — لحالة/مكان شحنة محددة.
+- "search": params {"client":"اسم العميل","status":"...","shipping_line":"...","overdue":true} — للبحث عن شحنات (كل الحقول اختيارية).
+- "count": params {"dimension":"status"|"client"|"shipping_line"} — للإحصاء والتوزيع.
+- "penalties": params {"by":"line"|"client","name":"اسم اختياري"} — للغرامات والمبالغ.
+- "alerts": بلا params — للمخاطر الحالية (أرضيات/متأخرة/انتهاء مستندات).
+- "unknown": إن لم تفهم.
+قيم status: opened, at_port, customs_clearance, in_transport, delivered, closed, cancelled.
+أعِد JSON فقط.`;
+
+  let intentObj = { intent:"unknown", params:{} };
+  try{
+    const r = await env.AI.run(AI_MODEL, { messages:[{role:"system",content:sys},{role:"user",content:q}], max_tokens:256, temperature:0.1 });
+    const resp = r ? r.response : null;
+    if(resp && typeof resp === "object" && resp.intent){
+      intentObj = resp;                                  // Workers AI أعاد JSON مُحلَّلاً
+    } else {
+      const txt = typeof resp === "string" ? resp : JSON.stringify(r||{});
+      const m = txt.match(/\{[\s\S]*\}/);
+      if(m) intentObj = JSON.parse(m[0]);
+    }
+  }catch(e){ /* fallback unknown */ }
+
+  const out = await runAiIntent(env, user, intentObj);
+  return ok({ answer: out.text, results: out.results||[], intent: intentObj.intent||"unknown" });
+}
+
+function aiClean(v){ if(v==null) return null; const s=String(v).trim(); return s===""?null:s; }
+async function runAiIntent(env, user, io){
+  const intent = (io && io.intent) || "unknown";
+  const p = (io && io.params) || {};
+  try{
+    if(intent==="shipment_status"){
+      const ref=aiClean(p.ref); if(!ref) return { text:"حدّد رقم الشحنة من فضلك." };
+      const s=await env.DB.prepare(`SELECT s.*, cl.name AS client_name, u.full_name AS assigned_name FROM shipments s LEFT JOIN clients cl ON cl.id=s.client_id LEFT JOIN users u ON u.id=s.assigned_to WHERE s.ref_no=? OR s.ref_no LIKE ? LIMIT 1`).bind(ref, `%${ref}%`).first();
+      if(!s) return { text:`لم أجد شحنة بالرقم «${ref}».` };
+      const st={opened:"مفتوحة",at_port:"في الميناء",customs_clearance:"تخليص كمركي",in_transport:"قيد النقل",delivered:"تم التسليم",closed:"مغلقة",cancelled:"ملغاة"}[s.status]||s.status;
+      let txt=`📦 الشحنة ${s.ref_no} (${s.client_name||"-"}): الحالة **${st}**.`;
+      if(s.destination) txt+=` الوجهة: ${s.destination}.`;
+      if(s.assigned_name) txt+=` المسؤول: ${s.assigned_name}.`;
+      if(s.latest_update) txt+=`\nآخر تحديث: ${s.latest_update}`;
+      return { text:txt, results:[{id:s.id, ref_no:s.ref_no, title:s.title, status:s.status, client_name:s.client_name}] };
+    }
+    if(intent==="search"){
+      const where=["s.status NOT IN ('cancelled')"]; const args=[];
+      if(aiClean(p.client)){ where.push("cl.name LIKE ?"); args.push(`%${aiClean(p.client)}%`); }
+      if(aiClean(p.status)){ where.push("s.status=?"); args.push(aiClean(p.status)); }
+      if(aiClean(p.shipping_line)){ where.push("s.shipping_line LIKE ?"); args.push(`%${aiClean(p.shipping_line)}%`); }
+      if(p.overdue===true||p.overdue==="true"){ where.push("s.eta < date('now') AND s.status NOT IN ('delivered','closed','cancelled')"); }
+      const rows=(await env.DB.prepare(`SELECT s.id, s.ref_no, s.title, s.status, s.eta, cl.name AS client_name FROM shipments s LEFT JOIN clients cl ON cl.id=s.client_id WHERE ${where.join(" AND ")} ORDER BY s.eta ASC LIMIT 30`).bind(...args).all()).results;
+      return { text: rows.length?`وجدت **${rows.length}** شحنة مطابقة:`:"لا توجد شحنات مطابقة لطلبك.", results: rows };
+    }
+    if(intent==="count"){
+      const dim={status:"s.status",client:"cl.name","shipping_line":"s.shipping_line"}[p.dimension]||"s.status";
+      const rows=(await env.DB.prepare(`SELECT ${dim} AS k, COUNT(*) AS c FROM shipments s LEFT JOIN clients cl ON cl.id=s.client_id GROUP BY k ORDER BY c DESC LIMIT 20`).all()).results;
+      const lbl={status:"الحالة",client:"العميل",shipping_line:"الخط الملاحي"}[p.dimension]||"الحالة";
+      const stMap={opened:"مفتوحة",at_port:"في الميناء",customs_clearance:"تخليص",in_transport:"نقل",delivered:"مُسلَّمة",closed:"مغلقة",cancelled:"ملغاة"};
+      const list=rows.map(r=>`• ${stMap[r.k]||r.k||"غير محدد"}: ${r.c}`).join("\n");
+      return { text:`توزيع الشحنات حسب ${lbl}:\n${list}` };
+    }
+    if(intent==="penalties"){
+      if(!can(user,"writePenalties") && !can(user,"manageUsers")) return { text:"عذرًا، معلومات الغرامات متاحة للمدراء وقسم الحسابات فقط." };
+      if(p.by==="line"||p.by==="client"){
+        const col=p.by==="line"?"shipping_line":"client";
+        let w=""; const args=[]; if(aiClean(p.name)){ w=`WHERE ${col} LIKE ?`; args.push(`%${aiClean(p.name)}%`); }
+        const rows=(await env.DB.prepare(`SELECT COALESCE(${col},'غير محدد') AS k, COUNT(*) c, COALESCE(SUM(penalty_amount),0) t FROM penalties ${w} GROUP BY k ORDER BY t DESC LIMIT 15`).bind(...args).all()).results;
+        const list=rows.map(r=>`• ${r.k}: ${Math.round(r.t).toLocaleString("en-US")} IQD (${r.c})`).join("\n");
+        return { text:`الغرامات حسب ${p.by==="line"?"الخط الملاحي":"العميل"}:\n${list}` };
+      }
+      const tot=await env.DB.prepare(`SELECT COUNT(*) c, COALESCE(SUM(penalty_amount),0) t FROM penalties`).first();
+      return { text:`إجمالي الغرامات: **${Math.round(tot.t).toLocaleString("en-US")} IQD** عبر ${tot.c} سجل.` };
+    }
+    if(intent==="alerts"){
+      const a=await alerts(env, user); const d=await a.json();
+      const c=d.counts||{};
+      return { text:`🔔 المخاطر الحالية:\n• خطر الأرضيات: ${c.demurrage||0}\n• انتهاء CD/LB: ${c.cdlb||0}\n• شحنات متأخرة: ${c.overdue||0}\n• راكدة: ${c.stale||0}` };
+    }
+  }catch(e){ return { text:"حدث خطأ أثناء جلب البيانات: "+e.message }; }
+  return { text:"لم أفهم سؤالك تمامًا. جرّب مثلاً:\n• «ما حالة شحنة Lot-B9-25-024؟»\n• «أرني شحنات SCHLUMBERGER المتأخرة»\n• «كم إجمالي الغرامات؟»\n• «ما المخاطر الحالية؟»" };
 }
 
 // =====================================================================
