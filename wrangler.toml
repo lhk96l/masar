@@ -25,6 +25,10 @@ database_id = "659bd0ab-4dc6-4f12-ba72-9601f1041f84"
 APP_NAME = "MASAR"
 ORG_NAME = "شركة عبر الشرق للخدمات النفطية"
 
+# تنبيهات واتساب المجدوَلة — 8 صباحًا و2 ظهرًا بتوقيت بغداد (UTC+3)
+[triggers]
+crons = ["0 5,11 * * *"]
+
 # الأسرار (تُضبط عبر: wrangler secret put <NAME>) — لا تُكتب هنا أبداً:
 #   JWT_SECRET     سرّ توقيع الجلسات (HMAC-SHA256)
 #   SETUP_TOKEN    توكن لمرة واحدة لإنشاء أول مدير عبر /api/setup

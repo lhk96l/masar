@@ -318,7 +318,74 @@ export default {
     headers.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
     return new Response(response.body, { status: response.status, headers });
   },
+
+  // مُشغّل مجدوَل (Cron) — تنبيهات واتساب للمخاطر الحرجة
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(runAlertNotifications(env));
+  },
 };
+
+// =====================================================================
+//  تنبيهات واتساب للمخاطر الحرجة (مجدوَلة)
+// =====================================================================
+async function runAlertNotifications(env){
+  try {
+    const recipients = String(env.WA_RECIPIENTS || "").split(",").map(s=>s.trim()).filter(Boolean);
+    if (!recipients.length) return; // لم تُضبط الأرقام بعد
+    const lines = [];
+
+    // 1) أرضيات: تجاوزت أيام السماح
+    const dem = (await env.DB.prepare(
+      `SELECT s.ref_no, cl.name AS client_name, c.port_arrival_date, c.free_days
+       FROM shipments s LEFT JOIN clients cl ON cl.id=s.client_id
+       LEFT JOIN customs_declarations c ON c.id=(SELECT id FROM customs_declarations WHERE shipment_id=s.id ORDER BY id DESC LIMIT 1)
+       WHERE s.status IN ('at_port','customs_clearance') AND c.port_arrival_date IS NOT NULL`
+    ).all()).results;
+    const demOver = [];
+    for (const r of dem){ const arr=new Date(String(r.port_arrival_date).replace(" ","T")); if(isNaN(arr))continue;
+      const days=Math.floor((Date.now()-arr)/86400000); const rem=(r.free_days||0)-days;
+      if(rem<=2) demOver.push(`• ${r.ref_no} (${r.client_name||"-"}): ${rem<0?("تجاوز "+Math.abs(rem)+" يوم"):("متبقّي "+rem+" يوم")}`); }
+    if(demOver.length) lines.push("⏱️ *خطر الأرضيات (Demurrage):*\n"+demOver.slice(0,15).join("\n"));
+
+    // 2) انتهاء CD/LB خلال 7 أيام أو منتهٍ
+    const ops=(await env.DB.prepare(
+      `SELECT abr_ref, cd_no, cd_new_expire, lb_no, lb_new_expire FROM customs_operations
+       WHERE status!='done' AND (cd_new_expire IS NOT NULL OR lb_new_expire IS NOT NULL)`).all()).results;
+    const cdlb=[];
+    for(const o of ops){ for(const [kind,no,exp] of [["CD",o.cd_no,o.cd_new_expire],["LB",o.lb_no,o.lb_new_expire]]){
+      if(!exp)continue; const d=new Date(String(exp).replace(" ","T")); if(isNaN(d))continue;
+      const left=Math.ceil((d-Date.now())/86400000);
+      if(left<=7) cdlb.push(`• ${kind} ${no||""} (${o.abr_ref||"-"}): ${left<0?("منتهٍ منذ "+Math.abs(left)+" يوم"):("خلال "+left+" يوم")}`); } }
+    if(cdlb.length) lines.push("📜 *انتهاء مستندات/كفالات الكمارك:*\n"+cdlb.slice(0,15).join("\n"));
+
+    // 3) شحنات متأخرة: تجاوزت ETA بأكثر من 3 أيام ولم تُسلَّم
+    const overdue=(await env.DB.prepare(
+      `SELECT s.ref_no, cl.name AS client_name, s.eta FROM shipments s LEFT JOIN clients cl ON cl.id=s.client_id
+       WHERE s.eta IS NOT NULL AND s.eta < date('now','-3 days') AND s.status NOT IN ('delivered','closed','cancelled')
+       ORDER BY s.eta ASC LIMIT 15`).all()).results;
+    if(overdue.length) lines.push("⚠️ *شحنات متأخرة (تجاوزت ETA):*\n"+overdue.map(r=>`• ${r.ref_no} (${r.client_name||"-"}): ETA ${r.eta}`).join("\n"));
+
+    if(!lines.length) return; // لا مخاطر — لا رسالة
+    const msg = "🛢️ *MASAR — تنبيهات شركة عبر الشرق*\n"+new Date().toLocaleDateString("ar")+"\n\n"+lines.join("\n\n")+"\n\n🔗 https://masar-bhw.pages.dev";
+    for(const to of recipients){ await sendWhatsApp(env, to, msg); }
+    try{ await env.DB.prepare(`INSERT INTO sync_log (source, inserted, updated, skipped, errors, detail) VALUES ('WA-ALERT',0,0,0,0,?)`).bind(`أُرسل تنبيه لـ ${recipients.length} رقم (${lines.length} فئة)`).run(); }catch(_){}
+  } catch(e){ /* صامت */ }
+}
+
+// إرسال واتساب — يدعم UltraMsg أو Meta Cloud API حسب الأسرار المضبوطة
+async function sendWhatsApp(env, to, body){
+  try{
+    if(env.WA_INSTANCE && env.WA_TOKEN){ // UltraMsg
+      await fetch(`https://api.ultramsg.com/${env.WA_INSTANCE}/messages/chat`, {
+        method:"POST", headers:{"Content-Type":"application/x-www-form-urlencoded"},
+        body:new URLSearchParams({ token:env.WA_TOKEN, to, body }) });
+    } else if(env.WA_META_PHONE_ID && env.WA_META_TOKEN){ // Meta WhatsApp Cloud API
+      await fetch(`https://graph.facebook.com/v20.0/${env.WA_META_PHONE_ID}/messages`, {
+        method:"POST", headers:{"Content-Type":"application/json","Authorization":"Bearer "+env.WA_META_TOKEN},
+        body:JSON.stringify({ messaging_product:"whatsapp", to, type:"text", text:{ body } }) });
+    }
+  }catch(_){}
+}
 
 async function route(request, env, url) {
   const path = url.pathname.replace(/\/+$/, "") || "/";
@@ -439,6 +506,15 @@ async function route(request, env, url) {
     if (method === "POST") return addStatusUpdate(request, env, user, id, ip);
   }
   if (path === "/api/alerts" && method === "GET") return alerts(env, user);
+  if (path === "/api/alerts/send-now" && method === "POST") {
+    if (!can(user, "manageUsers")) return err("لا تملك صلاحية", 403);
+    const recipients = String(env.WA_RECIPIENTS || "").split(",").map(s=>s.trim()).filter(Boolean);
+    const provider = (env.WA_INSTANCE && env.WA_TOKEN) ? "UltraMsg" : ((env.WA_META_PHONE_ID && env.WA_META_TOKEN) ? "Meta" : null);
+    if (!recipients.length) return err("لم تُضبط أرقام المستلمين (WA_RECIPIENTS) بعد", 400);
+    if (!provider) return err("لم يُضبط مزوّد واتساب (أسرار UltraMsg أو Meta) بعد", 400);
+    await runAlertNotifications(env);
+    return ok({ message: `تم تشغيل الإرسال عبر ${provider} لـ ${recipients.length} رقم`, provider, recipients: recipients.length });
+  }
 
   // ---------- المستندات ----------
   if ((m = path.match(/^\/api\/shipments\/(\d+)\/documents$/))) {
