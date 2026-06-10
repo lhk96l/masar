@@ -1798,6 +1798,32 @@ function gsMoney(v) { if (!v) return { amt:null, cur:null }; const s=String(v); 
 function gsImport(v) { const s=String(v||"").toLowerCase(); if(s.includes("perm"))return"permanent"; if(s.includes("ddp"))return"ddp"; if(s.includes("temp"))return"temporary"; if(s.includes("re-ex")||s.includes("reex"))return"reexport"; if(s.includes("licen"))return"import_license"; if(s.includes("renew"))return"renewal"; if(s.includes("cour"))return"courier"; return null; }
 function gsMode(v) { const s=String(v||"").toLowerCase(); if(s.includes("sea"))return"sea"; if(s.includes("air"))return"air"; if(s.includes("land")||s.includes("road"))return"land"; return null; }
 function gsStatus(v) { const s=String(v||"").toLowerCase(); if(s.includes("cancel")||s.includes("ملغ"))return"cancelled"; if(s.includes("deliver")||s.includes("تسليم")||s.includes("سلم"))return"delivered"; return"opened"; }
+// استنتاج ذكي للحالة من المحطات الزمنية + النص (الأكمل أولاً)
+function inferStatus(textStatus, f){
+  const t=String(textStatus||"").toLowerCase();
+  if(t.includes("cancel")||t.includes("ملغ")) return "cancelled";
+  if(f.accounting_invoice_date || f.finance_settlement_date) return "closed";
+  if(f.offloading_pod_date || f.arrival_site_date || t.includes("deliver")||t.includes("تسليم")||t.includes("سلم")) return "delivered";
+  if(f.loading_date || f.releasing_date) return "in_transport";
+  if(f.cc_receipt_date) return "customs_clearance";
+  if(f.vessel_ata || f.do1_date) return "at_port";
+  return "opened";
+}
+// ربط اسم PIC بحساب الموظف
+function normPic(s){ return String(s||"").toLowerCase().replace(/[^a-z]/g,""); }
+const PIC_ALIASES = { mohmed:"mohamed", mohamad:"mohamed", mohammed:"mohamed", ishraqq:"ishraq" };
+async function loadPicMap(env){
+  const map=new Map();
+  const { results } = await env.DB.prepare(`SELECT id, username FROM users WHERE active=1`).all();
+  for(const u of results){ const k=normPic(u.username); if(k) map.set(k, u.id); }
+  return map;
+}
+function resolvePic(picMap, name){
+  if(!picMap) return null;
+  let k=normPic(name); if(!k) return null;
+  if(PIC_ALIASES[k]) k=PIC_ALIASES[k];
+  return picMap.get(k) || null;
+}
 function gsBool(v){ return /^(true|1|yes|نعم|y)$/i.test(String(v||"").trim()); }
 function gsClean(v){ if(v==null) return null; const s=String(v).replace(/\s+/g," ").trim(); if(!s||/^(na|n\/a|true|false)$/i.test(s)) return null; return s; }
 // getter بتطابق جزئي لاسم العمود (للعناوين ثنائية اللغة)
@@ -1827,7 +1853,7 @@ async function ensureCarrier(env, name){
 }
 function diffFields(oldRow, fields){
   const ch={}; if(!oldRow) return ch;
-  const skip=new Set(["created_by","updated_at","created_at","id","client_id"]);
+  const skip=new Set(["created_by","updated_at","created_at","id","client_id","assigned_to","status"]);
   for(const k of Object.keys(fields)){
     if(skip.has(k)) continue;
     const o=oldRow[k]==null?"":String(oldRow[k]);
@@ -1877,13 +1903,14 @@ async function ingestSync(request, env){
   if(!body || !Array.isArray(body.sheets)) return err("صيغة غير صحيحة (sheets مطلوب)", 400);
   const stats={ inserted:0, updated:0, skipped:0, errors:0, tabs:{} };
   const clientCache=new Map();
+  const picMap=await loadPicMap(env);
   for(const sheet of body.sheets){
     try{
       const headers=(sheet.headers||[]).map(h=>String(h==null?"":h).trim());
       const rows=(sheet.rows||[]).map(r=>{ const o={}; headers.forEach((h,i)=>{ if(h) o[h]=r[i]; }); return o; });
       const type=routeTab(sheet.name, headers);
       let res={ins:0,upd:0,skip:0};
-      if(type==="shipment") res=await syncShipments(env, sheet.name, rows, clientCache);
+      if(type==="shipment") res=await syncShipments(env, sheet.name, rows, clientCache, picMap);
       else if(type==="customs_op") res=await syncCustomsOps(env, rows, clientCache, sheet.name);
       else if(type==="penalty") res=await syncPenalties(env, rows, sheet.name);
       else if(type==="transport") res=await syncTransport(env, rows, sheet.name);
@@ -1892,13 +1919,25 @@ async function ingestSync(request, env){
       stats.tabs[sheet.name]=`+${res.ins} ~${res.upd} =${res.skip}`;
     }catch(e){ stats.errors++; stats.tabs[sheet.name]="خطأ: "+(e.message||e); }
   }
-  try{ await env.DB.prepare(`INSERT INTO sync_log (source, inserted, updated, skipped, errors, detail) VALUES (?,?,?,?,?,?)`)
-    .bind(body.source||null, stats.inserted, stats.updated, stats.skipped, stats.errors, JSON.stringify(stats.tabs).slice(0,1800)).run(); }catch(_){}
+  // سجّل فقط عند وجود تغيير فعلي أو خطأ (يمنع تضخّم السجل)
+  if(stats.inserted || stats.updated || stats.errors){
+    try{ await env.DB.prepare(`INSERT INTO sync_log (source, inserted, updated, skipped, errors, detail) VALUES (?,?,?,?,?,?)`)
+      .bind(body.source||null, stats.inserted, stats.updated, stats.skipped, stats.errors, JSON.stringify(stats.tabs).slice(0,1800)).run(); }catch(_){}
+  }
+  // تنظيف تلقائي للسجلات القديمة (فرصة منخفضة لتفادي العبء)
+  if(Math.random() < 0.03){
+    try{ await env.DB.batch([
+      env.DB.prepare(`DELETE FROM sync_log WHERE created_at < datetime('now','-30 days')`),
+      env.DB.prepare(`DELETE FROM change_log WHERE created_at < datetime('now','-60 days')`),
+      env.DB.prepare(`DELETE FROM edit_log WHERE created_at < datetime('now','-60 days')`),
+      env.DB.prepare(`DELETE FROM activity_log WHERE created_at < datetime('now','-90 days')`),
+    ]); }catch(_){}
+  }
   return ok({ message:"تمت المزامنة", ...stats });
 }
 
 const SPECIAL_TABS=["spot shipment","re-export","inter. re-export"];
-async function syncShipments(env, tabName, rows, clientCache){
+async function syncShipments(env, tabName, rows, clientCache, picMap){
   let ins=0,upd=0,skip=0;
   const isSpecial=SPECIAL_TABS.includes(String(tabName||"").trim().toLowerCase());
   const isReexport=String(tabName||"").toLowerCase().includes("re-export");
@@ -1943,6 +1982,9 @@ async function syncShipments(env, tabName, rows, clientCache){
       exemption_approval:gsClean(r["Exemption Approval"]), transit_through:gsClean(r["Through"]),
       notes:(notesParts.join(" | ").slice(0,900)||null), created_by:1,
     };
+    // استنتاج الحالة الذكي من المحطات + ربط المسؤول بحساب الموظف
+    f.status = inferStatus(r["Status"], f);
+    f.assigned_to = resolvePic(picMap, r["PIC"]);
     const key="shipment:"+ref;
     const hash=await sha256hex(JSON.stringify(f));
     const res=await syncOne(env, key, hash, "shipment", f, "shipments",
