@@ -12,9 +12,10 @@ export async function renderSync(root, app) {
   const load = async () => {
     const box = document.getElementById("sync-body");
     box.innerHTML = spinner();
-    let st, ch;
+    let st, ch, ed;
     try { st = await API.syncStatus(); ch = await API.syncChanges("?limit=100"); }
     catch (e) { box.innerHTML = emptyState(e.message, "⚠️"); return; }
+    try { ed = await API.syncEdits("?limit=80"); } catch { ed = { edits: [] }; }
 
     const t = st.today || {};
     const lastAgo = st.last ? timeAgo(st.last) : "—";
@@ -36,7 +37,12 @@ export async function renderSync(root, app) {
       </div>
 
       <div class="card">
-        <div class="card-head"><h2>📝 من غيّر ماذا (آخر التغييرات)</h2></div>
+        <div class="card-head"><h2>👤 التعديلات المباشرة (حساب Google الفعلي)</h2></div>
+        <div class="card-body">${renderEdits(ed.edits || [])}</div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>📝 من غيّر ماذا (المسؤول PIC + الحقول)</h2></div>
         <div class="card-body">${renderChanges(ch.changes || [])}</div>
       </div>
 
@@ -71,6 +77,19 @@ export async function renderSync(root, app) {
     </div>`;
   }
   function fmtVal(v) { if (v == null || v === "") return "—"; return String(v); }
+
+  function renderEdits(rows) {
+    if (!rows.length) return emptyState("لا تعديلات مباشرة بعد (تظهر فور تعديل أي موظف لخلية في Google Sheets)", "👤");
+    return `<table class="table compact"><thead><tr><th>المُعدِّل (Google)</th><th>الملف/التبويب</th><th>الشحنة</th><th>العمود</th><th>قديم ← جديد</th><th>الوقت</th></tr></thead><tbody>
+      ${rows.map((e) => `<tr>
+        <td><strong>${esc(e.editor || "غير معروف")}</strong></td>
+        <td>${esc(e.tab || "—")}</td>
+        <td>${esc(e.ref_no || "—")}</td>
+        <td>${esc(e.column_header || "—")}</td>
+        <td><span class="chg-old">${esc(e.old_value || "—")}</span> ← <span class="chg-new">${esc(e.new_value || "—")}</span></td>
+        <td class="muted">${timeAgo(e.created_at)}</td></tr>`).join("")}
+    </tbody></table>`;
+  }
 
   function renderRuns(rows) {
     if (!rows.length) return emptyState("لا عمليات", "🕒");

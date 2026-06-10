@@ -346,6 +346,9 @@ async function route(request, env, url) {
   if (path === "/api/sync/ingest" && method === "POST") {
     return ingestSync(request, env);
   }
+  if (path === "/api/sync/edit" && method === "POST") {
+    return ingestEdit(request, env);
+  }
 
   // كل ما بعده يتطلب مصادقة
   const user = await authenticate(request, env);
@@ -542,6 +545,7 @@ async function route(request, env, url) {
   // ---------- حالة المزامنة وسجل التغييرات ----------
   if (path === "/api/sync/status" && method === "GET") return syncStatus(env, user);
   if (path === "/api/sync/changes" && method === "GET") return syncChanges(request, env, user, url);
+  if (path === "/api/sync/edits" && method === "GET") return syncEdits(request, env, user, url);
 
   // ---------- سجل النشاط ----------
   if (path === "/api/activity" && method === "GET") return listActivity(request, env, user, url);
@@ -1752,6 +1756,27 @@ async function syncChanges(request, env, user, url){
   const limit=Math.min(200, parseInt(url.searchParams.get("limit")||"80",10));
   const { results } = await env.DB.prepare(`SELECT * FROM change_log ORDER BY id DESC LIMIT ?`).bind(limit).all();
   return ok({ changes: results });
+}
+async function syncEdits(request, env, user, url){
+  if(!can(user,"manageUsers")) return err("لا تملك صلاحية", 403);
+  const limit=Math.min(200, parseInt(url.searchParams.get("limit")||"80",10));
+  const { results } = await env.DB.prepare(`SELECT * FROM edit_log ORDER BY id DESC LIMIT ?`).bind(limit).all();
+  return ok({ edits: results });
+}
+// استقبال تعديل مباشر من Google Sheets (onEdit) — محمي برمز
+async function ingestEdit(request, env){
+  const token=request.headers.get("X-Sync-Token")||"";
+  if(!env.SYNC_TOKEN || token.trim()!==env.SYNC_TOKEN.trim()) return err("رمز المزامنة غير صحيح", 403);
+  const b=await request.json().catch(()=>null);
+  if(!b) return err("صيغة غير صحيحة", 400);
+  try{
+    await env.DB.prepare(`INSERT INTO edit_log (editor, spreadsheet, tab, ref_no, column_header, old_value, new_value, row_num) VALUES (?,?,?,?,?,?,?,?)`)
+      .bind((b.editor||"").slice(0,160)||null, (b.spreadsheet||"").slice(0,160)||null, (b.tab||"").slice(0,120)||null,
+        (b.ref||"").slice(0,120)||null, (b.column||"").slice(0,120)||null,
+        (b.oldValue==null?null:String(b.oldValue).slice(0,500)), (b.newValue==null?null:String(b.newValue).slice(0,500)),
+        b.row?parseInt(b.row,10):null).run();
+  }catch(e){ return err("فشل التسجيل: "+e.message, 500); }
+  return ok({ message:"logged" });
 }
 
 // =====================================================================
