@@ -303,6 +303,18 @@ a { color: inherit; text-decoration: none; }
 .cont-chip { background: var(--surface-2); border: 1px solid var(--border); border-radius: 20px; padding: 4px 12px; font-size: 13px; }
 .cargo-foot { margin-top: 14px; }
 
+/* ---------- سجل تغييرات المزامنة (من غيّر ماذا) ---------- */
+.changes { display: flex; flex-direction: column; gap: 10px; max-height: 520px; overflow-y: auto; }
+.chg-row { padding: 10px 12px; background: var(--surface-2); border-radius: var(--radius-sm); border-right: 3px solid var(--green-500); }
+.chg-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.chg-who { font-weight: 700; color: var(--green-800); }
+.chg-ent { color: var(--muted); font-size: 13px; }
+.chg-time { margin-right: auto; }
+.chg-fields { margin-top: 6px; display: flex; flex-direction: column; gap: 3px; font-size: 13px; }
+.chg { padding: 2px 0; }
+.chg-old { color: var(--red); text-decoration: line-through; }
+.chg-new { color: var(--green); font-weight: 600; }
+
 /* ---------- التنبيهات داخل البطاقات ---------- */
 .alert { padding: 11px 14px; border-radius: var(--radius-sm); font-size: 13.5px; margin-top: 14px; }
 .alert-info { background: #eff6ff; color: #1e40af; border: 1px solid #bfdbfe; }

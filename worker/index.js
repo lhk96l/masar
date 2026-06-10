@@ -539,6 +539,10 @@ async function route(request, env, url) {
   // ---------- التقارير ----------
   if (path === "/api/reports" && method === "GET") return reports(env, user);
 
+  // ---------- حالة المزامنة وسجل التغييرات ----------
+  if (path === "/api/sync/status" && method === "GET") return syncStatus(env, user);
+  if (path === "/api/sync/changes" && method === "GET") return syncChanges(request, env, user, url);
+
   // ---------- سجل النشاط ----------
   if (path === "/api/activity" && method === "GET") return listActivity(request, env, user, url);
 
@@ -1733,6 +1737,24 @@ async function listActivity(request, env, user, url) {
 }
 
 // =====================================================================
+//  حالة المزامنة وسجل التغييرات (للمدير)
+// =====================================================================
+async function syncStatus(env, user){
+  if(!can(user,"manageUsers")) return err("لا تملك صلاحية", 403);
+  const recent=(await env.DB.prepare(`SELECT source, inserted, updated, skipped, errors, created_at FROM sync_log ORDER BY id DESC LIMIT 20`).all()).results;
+  const last=await env.DB.prepare(`SELECT created_at FROM sync_log ORDER BY id DESC LIMIT 1`).first();
+  const today=await env.DB.prepare(`SELECT COALESCE(SUM(inserted),0) AS ins, COALESCE(SUM(updated),0) AS upd, COALESCE(SUM(errors),0) AS err, COUNT(*) AS posts FROM sync_log WHERE created_at > datetime('now','-1 day')`).first();
+  const changesToday=await env.DB.prepare(`SELECT COUNT(*) AS c FROM change_log WHERE created_at > datetime('now','-1 day')`).first();
+  return ok({ last: last?last.created_at:null, recent, today, changes_today: changesToday.c });
+}
+async function syncChanges(request, env, user, url){
+  if(!can(user,"manageUsers")) return err("لا تملك صلاحية", 403);
+  const limit=Math.min(200, parseInt(url.searchParams.get("limit")||"80",10));
+  const { results } = await env.DB.prepare(`SELECT * FROM change_log ORDER BY id DESC LIMIT ?`).bind(limit).all();
+  return ok({ changes: results });
+}
+
+// =====================================================================
 //  مزامنة Google Sheets → MASAR (التوجيه + التحويل + كشف التغيير)
 // =====================================================================
 const GS_MO = { jan:"01",feb:"02",mar:"03",apr:"04",may:"05",jun:"06",jul:"07",aug:"08",sep:"09",oct:"10",nov:"11",dec:"12" };
@@ -1778,18 +1800,39 @@ async function ensureCarrier(env, name){
   await env.DB.prepare(`INSERT INTO carriers (name, created_by) SELECT ?,1 WHERE NOT EXISTS (SELECT 1 FROM carriers WHERE name=?)`).bind(name,name).run();
   return name;
 }
-// المزامنة الموحّدة: insert/update عبر sync_state + مطابقة الموجود
-async function syncOne(env, key, hash, entityType, fields, table, reconcileId){
+function diffFields(oldRow, fields){
+  const ch={}; if(!oldRow) return ch;
+  const skip=new Set(["created_by","updated_at","created_at","id","client_id"]);
+  for(const k of Object.keys(fields)){
+    if(skip.has(k)) continue;
+    const o=oldRow[k]==null?"":String(oldRow[k]);
+    const n=fields[k]==null?"":String(fields[k]);
+    if(o!==n) ch[k]={old:oldRow[k]??null, new:fields[k]??null};
+  }
+  return ch;
+}
+
+// المزامنة الموحّدة: insert/update عبر sync_state + مطابقة الموجود + تسجيل التغيير
+async function syncOne(env, key, hash, entityType, fields, table, reconcileId, meta){
   const st=await env.DB.prepare(`SELECT hash, entity_id FROM sync_state WHERE sync_key=?`).bind(key).first();
   if(st && st.hash===hash) return "skip";
   let id = st ? st.entity_id : null;
   let wasUpdate = !!st;
   if(!id && reconcileId){ const ex=await reconcileId(); if(ex){ id=ex; wasUpdate=true; } }
-  if(id){ await dbUpdate(env, table, fields, id); }
-  else { id = await dbInsert(env, table, fields); }
+  let changed=null;
+  if(id){
+    const old=await env.DB.prepare(`SELECT * FROM ${table} WHERE id=?`).bind(id).first();
+    changed=diffFields(old, fields);
+    await dbUpdate(env, table, fields, id);
+  } else { id = await dbInsert(env, table, fields); }
   await env.DB.prepare(`INSERT INTO sync_state (sync_key,hash,entity_type,entity_id) VALUES (?,?,?,?)
     ON CONFLICT(sync_key) DO UPDATE SET hash=excluded.hash, entity_id=excluded.entity_id, updated_at=datetime('now')`).bind(key,hash,entityType,id).run();
-  return wasUpdate ? "update" : "insert";
+  const action = wasUpdate ? "update" : "insert";
+  if(meta && (action==="insert" || (changed && Object.keys(changed).length>0))){
+    try{ await env.DB.prepare(`INSERT INTO change_log (entity_type, entity_id, ref_no, action, pic, changed_fields, source) VALUES (?,?,?,?,?,?,?)`)
+      .bind(entityType, id, meta.ref||null, action, meta.pic||null, changed?JSON.stringify(changed).slice(0,2000):null, meta.source||null).run(); }catch(_){}
+  }
+  return action;
 }
 
 function routeTab(name, headers){
@@ -1816,9 +1859,9 @@ async function ingestSync(request, env){
       const type=routeTab(sheet.name, headers);
       let res={ins:0,upd:0,skip:0};
       if(type==="shipment") res=await syncShipments(env, sheet.name, rows, clientCache);
-      else if(type==="customs_op") res=await syncCustomsOps(env, rows, clientCache);
-      else if(type==="penalty") res=await syncPenalties(env, rows);
-      else if(type==="transport") res=await syncTransport(env, rows);
+      else if(type==="customs_op") res=await syncCustomsOps(env, rows, clientCache, sheet.name);
+      else if(type==="penalty") res=await syncPenalties(env, rows, sheet.name);
+      else if(type==="transport") res=await syncTransport(env, rows, sheet.name);
       else { stats.tabs[sheet.name]="تخطّي"; continue; }
       stats.inserted+=res.ins; stats.updated+=res.upd; stats.skipped+=res.skip;
       stats.tabs[sheet.name]=`+${res.ins} ~${res.upd} =${res.skip}`;
@@ -1878,13 +1921,14 @@ async function syncShipments(env, tabName, rows, clientCache){
     const key="shipment:"+ref;
     const hash=await sha256hex(JSON.stringify(f));
     const res=await syncOne(env, key, hash, "shipment", f, "shipments",
-      async()=>{ const e=await env.DB.prepare(`SELECT id FROM shipments WHERE ref_no=?`).bind(ref).first(); return e?e.id:null; });
+      async()=>{ const e=await env.DB.prepare(`SELECT id FROM shipments WHERE ref_no=?`).bind(ref).first(); return e?e.id:null; },
+      { ref, pic:gsClean(r["PIC"]), source:tabName });
     if(res==="insert")ins++; else if(res==="update")upd++; else skip++;
   }
   return {ins,upd,skip};
 }
 
-async function syncCustomsOps(env, rows, clientCache){
+async function syncCustomsOps(env, rows, clientCache, source){
   let ins=0,upd=0,skip=0;
   for(const r of rows){
     const abr=gsClean(r["ABR Ref#"]); const cd=gsClean(r["CD #"]); const lb=gsClean(r["LB #"]);
@@ -1905,13 +1949,14 @@ async function syncCustomsOps(env, rows, clientCache){
     const key="custop:"+(abr||"")+"|"+(cd||"")+"|"+(lb||"");
     const hash=await sha256hex(JSON.stringify(f));
     const res=await syncOne(env, key, hash, "customs_op", f, "customs_operations",
-      async()=>{ const e=await env.DB.prepare(`SELECT id FROM customs_operations WHERE abr_ref IS ? AND cd_no IS ? AND lb_no IS ? LIMIT 1`).bind(abr,cd,lb).first(); return e?e.id:null; });
+      async()=>{ const e=await env.DB.prepare(`SELECT id FROM customs_operations WHERE abr_ref IS ? AND cd_no IS ? AND lb_no IS ? LIMIT 1`).bind(abr,cd,lb).first(); return e?e.id:null; },
+      { ref:abr, pic:gsClean(r["PIC"]), source });
     if(res==="insert")ins++; else if(res==="update")upd++; else skip++;
   }
   return {ins,upd,skip};
 }
 
-async function syncPenalties(env, rows){
+async function syncPenalties(env, rows, source){
   let ins=0,upd=0,skip=0;
   for(const r of rows){
     const ref=gsClean(gp(r,"Shipment Ref")); const amt=gsNum(gp(r,"Penalty Amount"));
@@ -1927,14 +1972,15 @@ async function syncPenalties(env, rows){
     };
     const key="penalty:"+(ref||"")+"|"+(amt==null?"":amt)+"|"+(sub||"");
     const hash=await sha256hex(JSON.stringify(f));
-    const res=await syncOne(env, key, hash, "penalty", f, "penalties", null);
+    const res=await syncOne(env, key, hash, "penalty", f, "penalties", null,
+      { ref, pic:gsClean(r["PIC"]), source });
     if(res==="insert")ins++; else if(res==="update")upd++; else skip++;
   }
   return {ins,upd,skip};
 }
 
 const GS_CARRIERS=[["سيارات عبر الشرق","سيارات عبر الشرق"],["عبدالله","الناقل عبدالله"],["علي نجيب","علي نجيب"],["راجي","راجي"],["سيف","سيف"],["علي راضي","علي راضي"],["أبو حيدر","أبو حيدر"],["بيت الهارف","بيت الهارف"]];
-async function syncTransport(env, rows){
+async function syncTransport(env, rows, source){
   let ins=0,upd=0,skip=0;
   for(const r of rows){
     const ref=gsClean(gp(r,"Shipment #","Shipment"));
@@ -1955,7 +2001,8 @@ async function syncTransport(env, rows){
         eir_received:gp(r,"EIR")?1:0, in_storage:gsBool(gp(r,"In Storage","في الخزن"))?1:0, status, notes, created_by:1 };
       const key="transport:"+ref+"|"+cname;
       const hash=await sha256hex(JSON.stringify(f));
-      const res=await syncOne(env, key, hash, "transport", f, "transport_orders", null);
+      const res=await syncOne(env, key, hash, "transport", f, "transport_orders", null,
+        { ref, pic:gsClean(gp(r,"PIC")), source });
       if(res==="insert")ins++; else if(res==="update")upd++; else skip++;
       made=true;
     }
@@ -1965,7 +2012,8 @@ async function syncTransport(env, rows){
         eir_received:gp(r,"EIR")?1:0, in_storage:gsBool(gp(r,"In Storage","في الخزن"))?1:0, status, notes, created_by:1 };
       const key="transport:"+ref+"|_";
       const hash=await sha256hex(JSON.stringify(f));
-      const res=await syncOne(env, key, hash, "transport", f, "transport_orders", null);
+      const res=await syncOne(env, key, hash, "transport", f, "transport_orders", null,
+        { ref, pic:gsClean(gp(r,"PIC")), source });
       if(res==="insert")ins++; else if(res==="update")upd++; else skip++;
     }
   }

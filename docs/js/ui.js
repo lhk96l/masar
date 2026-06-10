@@ -97,6 +97,28 @@ export function badge(label, color) {
   return `<span class="badge badge-${color || "gray"}">${esc(label)}</span>`;
 }
 
+// تسميات عربية لأسماء الحقول (لعرض التغييرات بوضوح)
+export const ENTITY_LABELS = { shipment: "شحنة", customs_op: "عملية كمركية", penalty: "غرامة", transport: "أمر نقل" };
+export const FIELD_LABELS = {
+  title:"العنوان", status:"الحالة", importation_type:"نوع الاستيراد", transport_mode:"وسيلة النقل",
+  shipping_line:"الخط الملاحي", shipping_agent:"الوكالة", vessel_name:"الباخرة", destination:"الوجهة",
+  bl_no:"بوليصة الشحن", container_no:"الحاوية", goods_description:"وصف البضاعة", call_off:"Call Off",
+  call_off_date:"تاريخ Call Off", eta:"ETA", etd:"ETD", vessel_ata:"وصول الباخرة", priority:"الأولوية",
+  docs_submission_date:"تقديم المستندات", do1_date:"أمر التسليم 1", do2_date:"أمر التسليم 2", do2_no:"رقم DO2",
+  trailer_booking_date:"حجز الشاحنة", trailer_entry_date:"دخول الشاحنة", loading_date:"التحميل",
+  releasing_date:"الفسح", arrival_site_date:"الوصول للموقع", offloading_pod_date:"التفريغ/POD",
+  return_token_date:"إرجاع التوكن", cc_receipt_date:"وصل التخليص", finance_settlement_date:"التسوية المالية",
+  handover_account_date:"تسليم للحسابات", accounting_invoice_date:"فاتورة العميل",
+  cont_20std:"20 STD", cont_20fr:"20 FR", cont_20ot:"20 OT", cont_40std:"40 STD", cont_40fr:"40 FR",
+  cont_40ot:"40 OT", cont_45:"45", lcl:"LCL", roro:"RORO", cbm:"CBM", weight_kg:"الوزن", total_pkgs:"الطرود",
+  total_trailers:"الشاحنات", packaging_type:"التغليف", sl_deposit:"الوديعة", sl_deducted:"المخصوم",
+  sl_returned:"المُعاد", deposit_currency:"عملة الوديعة", deposit_receipt_date:"وصل الوديعة", notes:"ملاحظات",
+  cd_no:"رقم CD", cd_new_expire:"انتهاء CD", lb_no:"رقم LB", lb_new_expire:"انتهاء LB", job_type:"نوع العملية",
+  penalty_amount:"مبلغ الغرامة", agent:"الوكالة", carrier:"الناقل", booked_trailers:"الشاحنات المحجوزة",
+  container_return_date:"إرجاع الحاوية", pre_alert_date:"Pre-alert", exemption_approval:"موافقة الإعفاء",
+};
+export function fieldLabel(k){ return FIELD_LABELS[k] || k; }
+
 // أنواع الحاويات (المرحلة 3) — مع معامل TEU لحساب المكافئ
 export const CONTAINER_TYPES = [
   { key: "cont_20std", label: "20 STD", teu: 1 },
